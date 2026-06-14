@@ -6,9 +6,19 @@ It does **not** bypass any limit — it just makes the official numbers visible 
 
 English | [简体中文](README.zh-CN.md)
 
-<!-- Add a screenshot here, e.g.:
-![screenshot](docs/screenshot.png)
-(The card shows only your usage % and a "MAX/PRO" badge — no email/account is shown. Just make sure nothing else in the screenshot leaks personal info.) -->
+<p align="center">
+  <img src="assets/card.png" width="430" alt="Claude Usage Assistant — the live card"><br>
+  <sub>The live card: 5-hour / 7-day / per-model windows, color-coded, each with its real reset time in your local timezone.</sub>
+</p>
+
+<p align="center">
+  <img src="assets/windows.png" width="300" alt="The tray shows a window's percent right in the taskbar">
+  &nbsp;&nbsp;
+  <img src="assets/menu.png" width="300" alt="Right-click menu">
+</p>
+<p align="center">
+  <sub><b>Left:</b> the tray icon shows your chosen window's % right in the taskbar (the green <b>17%</b> at the bottom-left), and the card can list every window your account exposes — here 5-hour, 7-day, and 7-day · Sonnet. &nbsp;·&nbsp; <b>Right:</b> the menu lets you toggle <b>each window on the card individually</b> and pick <b>which one the tray reflects</b>.</sub>
+</p>
 
 ## Features
 
@@ -16,7 +26,7 @@ English | [简体中文](README.zh-CN.md)
 - **Real reset time, your timezone** — shown as a local clock like `今天 04:19` / `06-17 21:59`, derived from your system timezone (UTC+8, UTC+7, …) automatically. A live system clock sits in the footer.
 - **System-tray icon** showing a chosen window's percentage with a `%` sign (default: 5-hour). Left-click toggles the card; hover for a full breakdown.
 - **Frameless, draggable, always-on-top card.** Resize by mouse-wheel, by dragging the window edges/corners, or via the menu.
-- **Menu** (right-click or the `☰` button): pick **which windows show on the card**, **which one the tray reflects**, plus zoom, opacity, and reset-display mode (clock vs. countdown).
+- **Menu** (right-click or the `☰` button): **show or hide each window on the card individually** (5-hour, 7-day, 7-day · Sonnet, …), pick **which one the tray reflects**, plus zoom, opacity, and reset-display mode (clock vs. countdown).
 - Remembers position, size, opacity, and preferences. **Single-instance guard.** Optional **autostart**.
 - Pure standard-library **tkinter** UI — no heavy UI framework. ~600 lines, single file, fully auditable.
 
@@ -93,7 +103,7 @@ Report back in my language when done.
 - **Drag** the card to move it (position is remembered).
 - **Mouse-wheel** to zoom · **drag window edges/corners** to resize · **Ctrl + wheel** to fine-tune opacity.
 - **Top bar:** `▲` keep-on-top · `☰` menu · `↻` refresh · `✕` quit.
-- **Menu** (right-click or `☰`): Refresh · Card items · Tray item · Zoom · Opacity · Reset display · Keep on top · Hide to tray · Quit.
+- **Menu** (right-click or `☰`): Refresh · **Card items** (tick each window — 5-hour / 7-day / 7-day · Sonnet … — to show or hide it on the card) · **Tray item** (which window's % the tray shows) · Zoom · Opacity · Reset display · Keep on top · Hide to tray · Quit.
 - **Tray icon:** shows the selected window's `%`; left-click toggles the card; right-click for the menu.
 
 Bar colors: green `< 50%`, amber `50–80%`, red `≥ 80%`.
@@ -110,6 +120,10 @@ Preferences (position, zoom, opacity, shown items, tray item, reset mode) are sa
 ## Autostart (optional)
 
 Press `Win + R`, type `shell:startup`, and drop a shortcut to `启动卡片.bat` (or to `pythonw.exe "…\quota_card.py"`) into that folder.
+
+## Friend Links
+
+- [LINUX DO](https://linux.do/) — a community for developers and tech enthusiasts.
 
 ## Credits
 

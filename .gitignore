@@ -19,6 +19,11 @@ launch_err.log
 *credentials*.json
 *.token
 
+# Source screenshots kept locally — the published copies live in assets/
+/1.png
+/2.png
+/3.png
+
 # OS / editor
 Thumbs.db
 desktop.ini
