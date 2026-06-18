@@ -425,9 +425,16 @@ class QuotaCard:
             return
         try:
             while True:
-                cmd, _ = self.cmd_q.get_nowait()
-                {"toggle_card": self.toggle_card, "refresh": self.refresh_now,
-                 "quit": self.quit}.get(cmd, lambda: None)()
+                cmd, payload = self.cmd_q.get_nowait()
+                if cmd == "toggle_card":
+                    self.toggle_card()
+                elif cmd == "refresh":
+                    self.refresh_now()
+                elif cmd == "quit":
+                    self.quit()
+                elif cmd == "menu_at":
+                    # 托盘右键(原生 SNI 的 ContextMenu):在桌面给出的屏幕坐标处弹出菜单
+                    self.open_menu(payload)
         except queue.Empty:
             pass
         if not self._stop:
@@ -559,6 +566,25 @@ class QuotaCard:
 
     # ---- 托盘 ----
     def _setup_tray(self):
+        # Linux:优先用原生 StatusNotifierItem(见 tray_sni.py)。桌面在左键时调用 Activate、
+        # 右键时调用 ContextMenu、中键调用 SecondaryActivate,均由应用直接接管——
+        # 因此左键单击=显示/隐藏卡片、右键=弹菜单、中键=立即刷新,行为与 Windows 一致,
+        # 且不依赖 pystray 在 KDE/Wayland 下不可靠的点击转发。
+        # 注册失败(桌面无 SNI 宿主)时,回退到 pystray 的原有交互。
+        if IS_LINUX:
+            try:
+                from tray_sni import SNITray
+                self.tray = SNITray(
+                    "claude_quota", self._tray_image(0, (70, 196, 106)), "Claude 用量",
+                    on_activate=lambda x, y: self.cmd_q.put(("toggle_card", None)),
+                    on_context=lambda x, y: self.cmd_q.put(("menu_at", (x, y))),
+                    on_secondary=lambda x, y: self.cmd_q.put(("refresh", None)),
+                )
+                threading.Thread(target=self.tray.run, daemon=True).start()
+                self.tray.wait_ready()
+                return
+            except Exception:
+                self.tray = None  # 原生 SNI 不可用,继续尝试 pystray
         try:
             import pystray
             import PIL
@@ -576,19 +602,22 @@ class QuotaCard:
 
     def _tray_image(self, util, rgb):
         from PIL import Image, ImageDraw
-        sz = 64
+        # 用 128px 高分辨率绘制,交给托盘缩小显示后数字更锐利清晰
+        sz = 128
+        pad = 4
         img = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
-        # 背景几乎填满整张图(让托盘里看起来和别的图标一样大),用量色描边
-        d.rounded_rectangle([1, 1, sz - 2, sz - 2], radius=14,
-                            fill=(27, 28, 32, 255), outline=tuple(rgb) + (255,), width=4)
+        # 圆角底色块几乎铺满整张图,外圈用量色描边(绿/黄/红随档位变化)
+        d.rounded_rectangle([pad, pad, sz - pad - 1, sz - pad - 1], radius=int(sz * 0.22),
+                            fill=(27, 28, 32, 255), outline=tuple(rgb) + (255,), width=int(sz * 0.06))
         txt = f"{int(round(util))}%"
-        # 自适应字号:在留白内尽量放大
-        font = self._load_font(16)
-        for size in range(46, 14, -2):
+        # 自适应字号:在描边内尽量放大百分比数字,让托盘里一眼可读(放宽留白以获得更大字号)
+        max_w, max_h = int(sz * 0.84), int(sz * 0.78)
+        font = self._load_font(int(sz * 0.4))
+        for size in range(int(sz * 0.66), 16, -2):
             cand = self._load_font(size)
             bb = d.textbbox((0, 0), txt, font=cand)
-            if bb[2] - bb[0] <= sz - 12 and bb[3] - bb[1] <= sz - 18:
+            if bb[2] - bb[0] <= max_w and bb[3] - bb[1] <= max_h:
                 font = cand
                 break
         bb = d.textbbox((0, 0), txt, font=font)
@@ -598,13 +627,39 @@ class QuotaCard:
 
     @staticmethod
     def _load_font(size):
+        """挑一个真正存在的、可按 size 缩放的粗体字体来画托盘里的百分比数字。
+
+        早期实现只尝试 Windows 字体路径,在 Linux/mac 上全部失败后会退到 PIL 自带的
+        位图默认字体,而那个字体不随 size 放大,导致托盘数字恒为约 11px 的小字、看不清。
+        这里补齐各平台常见的粗体 TTF,并以 Pillow>=10.1 可缩放的 load_default(size) 兜底。
+        """
         from PIL import ImageFont
-        for fp in ("C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/arialbd.ttf"):
+        candidates = (
+            # Linux:Fedora 默认 Noto;其余发行版常见 DejaVu / Liberation
+            "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Bold.ttc",
+            "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/liberation-sans-fonts/LiberationSans-Bold.ttf",
+            # macOS
+            "/System/Library/Fonts/Helvetica.ttc",
+            "/Library/Fonts/Arial Bold.ttf",
+            # Windows
+            "C:/Windows/Fonts/segoeuib.ttf",
+            "C:/Windows/Fonts/arialbd.ttf",
+            # 仅给文件名:交给 PIL 在自身字体搜索路径里定位
+            "DejaVuSans-Bold.ttf", "Arial Bold.ttf", "arialbd.ttf",
+        )
+        for fp in candidates:
             try:
                 return ImageFont.truetype(fp, size)
             except Exception:
-                pass
-        return ImageFont.load_default()
+                continue
+        # 兜底:Pillow>=10.1 的 load_default 接受 size 参数,返回可缩放的内置 TrueType 字体
+        try:
+            return ImageFont.load_default(size)
+        except TypeError:
+            return ImageFont.load_default()
 
     def _update_tray(self, avail):
         if not self.tray or not avail:
@@ -733,9 +788,13 @@ class QuotaCard:
             self.set_zoom(self.zoom * (1.08 if e.delta > 0 else 1 / 1.08))
 
     # ---- 菜单 ----
-    def open_menu(self):
+    def open_menu(self, at=None):
+        # at 给定时按该屏幕坐标弹出(托盘右键场景);否则跟随鼠标当前位置(卡片内点击场景)
         self._build_menu()
-        x, y = self.root.winfo_pointerxy()
+        if at is not None:
+            x, y = int(at[0]), int(at[1])
+        else:
+            x, y = self.root.winfo_pointerxy()
         try:
             self.menu.tk_popup(x, y)
         finally:
