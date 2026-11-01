@@ -99,8 +99,16 @@ python3 quota_card.py    # macOS / Linux
 
 - **Windows:** 或双击 **`启动卡片.bat`**(无控制台窗口启动)。
 - **macOS:** 或在访达里双击 **`启动卡片.command`**(后台运行,弹出的终端窗口可直接关掉)。
-- **macOS / Linux:** 或运行 **`./start.sh`**(加 `--detach` 后台运行)。它会自动挑一个真正带 Tk 8.6+ 且装了 `requests` 的 Python,找不到时会告诉你该装什么;也可用 `QUOTA_CARD_PYTHON=/path/to/python3` 指定。
+- **macOS / Linux:** 或运行 **`./start.sh`**(加 `--detach` 后台运行)。它会优先检测项目的 `.venv/bin/python`(无需手动激活),再查找其它带 Tk 8.6+ 且装了 `requests` 的 Python;找不到时会告诉你该装什么。也可用 `QUOTA_CARD_PYTHON=/path/to/python3` 指定。
 - macOS/Linux 首次若脚本不可执行:`chmod +x start.sh 启动卡片.command`。
+
+macOS 上已有 `uv` 和带 Tk 的 `python3.12` 时,可以用独立环境安装。本项目的 `requirements-macos.lock` 固定了 2026-11-01 在 Apple Silicon / Python 3.12 上验证的依赖版本:
+
+```sh
+uv venv --python python3.12 --no-python-downloads --no-cache .venv
+uv pip install --python .venv/bin/python --no-cache --only-binary :all: -r requirements-macos.lock
+./start.sh
+```
 
 ### 应用图标(macOS / Linux,可选)
 

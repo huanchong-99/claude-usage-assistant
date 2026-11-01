@@ -18,9 +18,9 @@ usable() {  # $1 = 候选解释器
     [ -n "$1" ] && [ -x "$1" ] || return 1
     "$1" -c 'import sys, tkinter, requests; sys.exit(0 if sys.version_info >= (3, 9) and tkinter.TkVersion >= 8.6 else 1)' >/dev/null 2>&1
 }
-has_tk() {
+has_runtime() {
     [ -n "$1" ] && [ -x "$1" ] || return 1
-    "$1" -c 'import tkinter' >/dev/null 2>&1
+    "$1" -c 'import sys, tkinter; sys.exit(0 if sys.version_info >= (3, 9) and tkinter.TkVersion >= 8.6 else 1)' >/dev/null 2>&1
 }
 
 IS_MAC=0
@@ -31,6 +31,7 @@ IS_MAC=0
 # 而且在没装命令行工具的机器上一探测就会弹出安装窗口。
 candidates() {
     [ -n "$QUOTA_CARD_PYTHON" ] && echo "$QUOTA_CARD_PYTHON"
+    echo "./.venv/bin/python"  # 项目独立环境,无需手动激活
     for name in python3 python; do
         p="$(command -v "$name" 2>/dev/null)" || continue
         [ "$IS_MAC" = 1 ] && [ "$p" = "/usr/bin/python3" ] && continue
@@ -52,7 +53,7 @@ PY=""
 FALLBACK=""
 for c in $(candidates | awk '!seen[$0]++'); do
     if usable "$c"; then PY="$c"; break; fi
-    [ -z "$FALLBACK" ] && has_tk "$c" && FALLBACK="$c"
+    [ -z "$FALLBACK" ] && has_runtime "$c" && FALLBACK="$c"
 done
 # QUOTA_CARD_PYTHON 路径里含空格时上面的 for 会拆开,单独再试一次
 if [ -z "$PY" ] && usable "$QUOTA_CARD_PYTHON"; then PY="$QUOTA_CARD_PYTHON"; fi

@@ -1,0 +1,13 @@
+# macOS arm64 / Python 3.12; installed and verified on 2026-11-01.
+# Rebuild with: uv pip install --python .venv/bin/python --no-cache --only-binary :all: -r requirements-macos.lock
+certifi==2026.10.23
+charset-normalizer==3.5.2
+idna==3.20
+pillow==13.0.0
+pyobjc-core==13.0
+pyobjc-framework-cocoa==13.0
+pyobjc-framework-quartz==13.0
+pystray==0.19.5
+requests==2.34.2
+six==1.17.0
+urllib3==2.8.0

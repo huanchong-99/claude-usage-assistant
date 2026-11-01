@@ -99,8 +99,16 @@ python3 quota_card.py    # macOS / Linux
 
 - **Windows:** or double-click **`启动卡片.bat`** (launches with no console window).
 - **macOS:** or double-click **`启动卡片.command`** in Finder (runs in the background; you can close the Terminal window it opens).
-- **macOS / Linux:** or run **`./start.sh`** (`--detach` to background it). It picks a Python that actually has Tk 8.6+ and `requests`, and tells you what to install if none does. Override with `QUOTA_CARD_PYTHON=/path/to/python3`.
+- **macOS / Linux:** or run **`./start.sh`** (`--detach` to background it). It checks the project's `.venv/bin/python` first (no activation needed), then looks for other interpreters with Tk 8.6+ and `requests`. It tells you what to install if none qualifies. Override with `QUOTA_CARD_PYTHON=/path/to/python3`.
 - First time on macOS/Linux, if the scripts aren't executable: `chmod +x start.sh 启动卡片.command`.
+
+On macOS, if `uv` and a Tk-enabled `python3.12` are already installed, use an isolated environment. `requirements-macos.lock` pins the dependencies verified on Apple Silicon / Python 3.12 on 2026-11-01:
+
+```sh
+uv venv --python python3.12 --no-python-downloads --no-cache .venv
+uv pip install --python .venv/bin/python --no-cache --only-binary :all: -r requirements-macos.lock
+./start.sh
+```
 
 ### App icon (macOS / Linux, optional)
 
