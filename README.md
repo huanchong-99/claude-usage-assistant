@@ -36,6 +36,7 @@ English | [简体中文](README.zh-CN.md)
 - **Native on macOS** — the live % sits in the **menu bar** as crisp colored text (not a blurry 22-px bitmap), the Dock icon is hidden like a real menu-bar utility, the pinned card **follows you across Spaces and over full-screen apps**, right-click works with two-finger tap / Control-click, and `⌘Q` / logout quit cleanly.
 - **Lightweight** — only the parts that change are redrawn each second (~10× less CPU than before), background updates wake the UI through an event pipe instead of polling, credentials and the desktop-token decryption are cached, and Claude + Codex are fetched in parallel.
 - **One-click autostart** — tick **Start at login** in the menu (Windows Run key / macOS LaunchAgent / Linux autostart entry).
+- **App icon on macOS / Linux** — `./start.sh --install-app` adds a real app: Spotlight / Launchpad / Dock on macOS, the application menu on Linux. Opening it again brings the running card to the front.
 - Pure standard-library **tkinter** UI — no heavy UI framework. One main file (plus `tray_sni.py`, the optional Linux native tray), fully auditable.
 
 ## Where the token comes from · why it stops expiring
@@ -101,6 +102,19 @@ python3 quota_card.py    # macOS / Linux
 - **macOS / Linux:** or run **`./start.sh`** (`--detach` to background it). It picks a Python that actually has Tk 8.6+ and `requests`, and tells you what to install if none does. Override with `QUOTA_CARD_PYTHON=/path/to/python3`.
 - First time on macOS/Linux, if the scripts aren't executable: `chmod +x start.sh 启动卡片.command`.
 
+### App icon (macOS / Linux, optional)
+
+Create a launcher you can open like any other app:
+
+```sh
+./start.sh --install-app        # --uninstall-app to remove
+```
+
+- **macOS:** creates `~/Applications/AI 用量卡片.app` — open it from **Spotlight** or **Launchpad**, or drag it to the **Dock**.
+- **Linux:** adds **AI Usage Card** (AI 用量卡片) with an icon to your application menu / Activities search.
+- Opening it while the card is already running brings the card back (even when it's hidden to the tray) instead of starting a second copy.
+- It records the current Python and project path — if you move the folder or switch Python, run it again.
+
 Verify the data pull without opening the UI (add `--check`):
 
 ```sh
@@ -138,6 +152,7 @@ When you read this, you are an AI coding assistant. Please deploy "AI Usage Assi
 3. Confirm I have signed in to Claude (the Claude desktop app is enough, or a terminal `claude` login; token in ~/.claude/.credentials.json or the macOS Keychain). If I also use OpenAI Codex, confirm I'm logged in (`codex` → ~/.codex/auth.json).
 4. Run the app (python quota_card.py on Windows, python3 quota_card.py on macOS/Linux) and verify the card shows my usage; if it errors, diagnose and fix it. You can run `python quota_card.py --check` for a quick self-test.
 5. Ask whether I want it to start automatically at login; if yes, run it once with --autostart on (using the same Python), which registers it the right way for my OS.
+6. On macOS / Linux, ask whether I want an app icon (Spotlight / Launchpad / Dock, or the Linux app menu); if yes, run ./start.sh --install-app.
 Report back in my language when done.
 ```
 

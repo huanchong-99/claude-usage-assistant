@@ -36,6 +36,7 @@
 - **macOS 原生体验** —— 百分比以**彩色文字显示在菜单栏**(清晰锐利,不再是被缩成 22px 的模糊位图);像原生菜单栏小工具一样**隐藏 Dock 图标**;置顶时卡片**跟随你切换所有桌面(Spaces)、可浮在全屏 App 之上**;右键 / 双指轻点 / Control+单击 都能开菜单;`⌘Q`、注销、关机都会正常保存退出。
 - **轻量省电** —— 每秒只重绘变化的几处文字(CPU 占用约为原来的 1/10);后台数据通过事件管道唤醒界面而非定时轮询;凭证与桌面版令牌解密结果都有缓存;Claude 与 Codex 并发拉取。
 - **一键开机自启** —— 菜单里勾选 **开机自启** 即可(Windows 注册表 Run / macOS LaunchAgent / Linux autostart)。
+- **macOS / Linux 应用图标** —— `./start.sh --install-app` 生成真正的应用:macOS 可从 Spotlight / 启动台 / Dock 打开,Linux 出现在应用菜单里。再次打开会把正在运行的卡片调到前台。
 - 界面使用 Python 自带 **tkinter**,无重型 UI 框架;一个主文件(外加可选的 Linux 原生托盘 `tray_sni.py`),可逐行审计。
 
 ## 令牌从哪来 · 为什么不再过期
@@ -101,6 +102,19 @@ python3 quota_card.py    # macOS / Linux
 - **macOS / Linux:** 或运行 **`./start.sh`**(加 `--detach` 后台运行)。它会自动挑一个真正带 Tk 8.6+ 且装了 `requests` 的 Python,找不到时会告诉你该装什么;也可用 `QUOTA_CARD_PYTHON=/path/to/python3` 指定。
 - macOS/Linux 首次若脚本不可执行:`chmod +x start.sh 启动卡片.command`。
 
+### 应用图标(macOS / Linux,可选)
+
+生成一个像普通应用一样打开的入口:
+
+```sh
+./start.sh --install-app        # 移除用 --uninstall-app
+```
+
+- **macOS:** 生成 `~/Applications/AI 用量卡片.app`——可从 **Spotlight**、**启动台** 打开,或拖到 **Dock**。
+- **Linux:** 在应用菜单 / 活动搜索里加入带图标的 **AI 用量卡片**。
+- 卡片已在运行时再次打开,会把卡片调到前台(即使它正藏在托盘里),不会启动第二份。
+- 入口记录的是当前的 Python 和项目路径——移动了项目文件夹或换了 Python,重新运行一次即可。
+
 不开界面、仅拉取一次数据自检(加 `--check`):
 
 ```sh
@@ -138,6 +152,7 @@ python quota_card.py --check     # macOS/Linux:python3 quota_card.py --check
 3. 确认我已登录过 Claude(用 Claude 桌面版即可,或终端 claude 登录;凭证在 ~/.claude/.credentials.json 或 macOS 钥匙串);若我也用 OpenAI Codex,确认我已 codex 登录(凭证在 ~/.codex/auth.json)。
 4. 运行程序(Windows 用 python quota_card.py,macOS/Linux 用 python3 quota_card.py),确认卡片能正常显示用量;若报错请排查并修复。可先跑 python quota_card.py --check 快速自检。
 5. 询问我是否需要开机自启;需要的话,用同一个 Python 运行一次 quota_card.py --autostart on,它会按我的系统用正确方式注册。
+6. 如果是 macOS / Linux,询问我是否需要应用图标(Spotlight / 启动台 / Dock,或 Linux 应用菜单);需要的话运行 ./start.sh --install-app。
 完成后用中文向我汇报结果。
 ```
 

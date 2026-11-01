@@ -29,6 +29,8 @@ Claude / Codex 实时限额卡片  (quota_card.py)
 命令行:
   --check            不开界面,只拉一次数据并打印诊断信息
   --autostart on|off 开启 / 关闭开机自启(Windows 注册表 Run / macOS LaunchAgent / Linux autostart)
+  --install-app      创建应用入口:macOS 为 ~/Applications 里的 .app,Linux 为应用菜单启动项
+  --uninstall-app    移除应用入口
 """
 from __future__ import annotations
 
@@ -1122,16 +1124,159 @@ def set_autostart(on: bool) -> bool:
                 plist["EnvironmentVariables"] = env
             f.write_bytes(plistlib.dumps(plist))
         else:
-            def q(s: str) -> str:  # .desktop Exec 字段:整个参数用双引号包住,内部 " ` $ \ 转义
-                return '"' + "".join("\\" + ch if ch in '"`$\\' else ch for ch in s) + '"'
-            args = (["env"] + [f"{k}={v}" for k, v in env.items()] if env else []) + argv
-            exec_line = " ".join(q(a) for a in args)
             f.write_text("[Desktop Entry]\nType=Application\nName=AI Usage Card\n"
-                         f"Exec={exec_line}\nTerminal=false\nNoDisplay=true\n"
+                         f"Exec={_desktop_exec(argv, env)}\nTerminal=false\nNoDisplay=true\n"
                          "X-GNOME-Autostart-enabled=true\n", encoding="utf-8")
         return True
     except Exception:
         return False
+
+
+def _desktop_exec(argv: list[str], env: dict) -> str:
+    """.desktop 的 Exec 字段:每个参数整体用双引号包住,内部 " ` $ \\ 转义;有环境变量时经 env 传入。"""
+    def q(a: str) -> str:
+        return '"' + "".join("\\" + ch if ch in '"`$\\' else ch for ch in a) + '"'
+    args = (["env"] + [f"{k}={v}" for k, v in env.items()] if env else []) + argv
+    return " ".join(q(a) for a in args)
+
+
+# ================= 应用入口(macOS .app / Linux 应用菜单) =================
+APP_DISPLAY_NAME = "AI 用量卡片"
+
+
+def _app_icon(size: int = 1024):
+    """应用图标:深色圆角卡片 + 绿 / 黄 / 红三条用量条(呼应卡片本身)。需要 Pillow,没有则返回 None。"""
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        return None
+    k = size / 256.0
+
+    def box(*v):
+        return [int(round(x * k)) for x in v]
+
+    def col(h):
+        return _hex_rgb(h) + (255,)
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle(box(22, 22, 234, 234), radius=int(52 * k), fill=col(C_CARD),
+                        outline=col(C_BORDER), width=max(1, int(4 * k)))
+    d.ellipse(box(50, 56, 70, 76), fill=col(C_ACCENT))
+    d.rounded_rectangle(box(82, 60, 162, 72), radius=int(6 * k), fill=col(C_TITLE))
+    for i, (frac, c) in enumerate(((0.36, C_GREEN), (0.62, C_AMBER), (0.86, C_RED))):
+        y = 104 + i * 40
+        d.rounded_rectangle(box(50, y, 206, y + 18), radius=int(9 * k), fill=col(C_TRACK))
+        d.rounded_rectangle(box(50, y, 50 + 156 * frac, y + 18), radius=int(9 * k), fill=col(c))
+    return img
+
+
+def _mac_app_path() -> Path:
+    return Path.home() / "Applications" / f"{APP_DISPLAY_NAME}.app"
+
+
+def _linux_launcher_paths() -> tuple[Path, Path]:
+    """(应用菜单 .desktop 文件, 图标 PNG)。"""
+    data = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+    return data / "applications" / "ai-usage-card.desktop", data / "icons" / "ai-usage-card.png"
+
+
+def app_installed() -> bool:
+    if IS_MAC:
+        return _mac_app_path().exists()
+    if IS_LINUX:
+        return _linux_launcher_paths()[0].exists()
+    return False
+
+
+def install_app() -> Path | None:
+    """生成应用入口,返回其路径(失败 / 不支持返回 None)。重复执行会覆盖更新(如项目换了位置)。
+         macOS:~/Applications/AI 用量卡片.app —— 可从 Spotlight / 启动台打开、拖进 Dock
+         Linux:~/.local/share/applications/ai-usage-card.desktop —— 出现在应用菜单 / 活动搜索里
+       入口记录的是当前解释器 + 本脚本路径(与开机自启相同),用哪个 Python 运行本命令就用哪个启动。"""
+    argv, env = _launch_argv(), _passthrough_env()
+    script_dir = str(Path(__file__).resolve().parent)
+    try:
+        if IS_MAC:
+            import plistlib
+            import shlex
+            import shutil
+            import subprocess
+            app = _mac_app_path()
+            if app.exists():
+                shutil.rmtree(app)
+            macos_dir, res_dir = app / "Contents" / "MacOS", app / "Contents" / "Resources"
+            macos_dir.mkdir(parents=True)
+            res_dir.mkdir(parents=True)
+            exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items())
+            alert = ("display alert \"" + APP_DISPLAY_NAME + "\" message \"找不到程序或 Python 解释器(项目目录"
+                     "可能已移动)。请在项目目录重新运行:./start.sh --install-app\"")
+            launcher = macos_dir / "launcher"
+            # 启动器只负责在后台拉起程序然后立刻退出:卡片进程自己管理 Dock / 菜单栏图标
+            launcher.write_text(
+                "#!/bin/sh\n"
+                "# 由 quota_card.py --install-app 生成;项目目录或 Python 变了,重新运行一次 --install-app 即可\n"
+                f"{exports}"
+                f"if [ ! -f {shlex.quote(argv[1])} ] || [ ! -x {shlex.quote(argv[0])} ]; then\n"
+                f"  osascript -e {shlex.quote(alert)} >/dev/null 2>&1\n"
+                "  exit 1\n"
+                "fi\n"
+                f"cd {shlex.quote(script_dir)} || exit 1\n"
+                f"nohup {' '.join(shlex.quote(a) for a in argv)} >/dev/null 2>&1 &\n", encoding="utf-8")
+            launcher.chmod(0o755)
+            info = {"CFBundleName": APP_DISPLAY_NAME, "CFBundleDisplayName": APP_DISPLAY_NAME,
+                    "CFBundleIdentifier": LAUNCH_AGENT_LABEL + ".launcher", "CFBundleExecutable": "launcher",
+                    "CFBundlePackageType": "APPL", "CFBundleShortVersionString": "1.0", "CFBundleVersion": "1",
+                    "LSUIElement": True, "LSMinimumSystemVersion": "10.13", "NSHighResolutionCapable": True}
+            icon = _app_icon(1024)
+            if icon is not None:
+                icon.save(res_dir / "AppIcon.icns")
+                info["CFBundleIconFile"] = "AppIcon"
+            (app / "Contents" / "Info.plist").write_bytes(plistlib.dumps(info))
+            # 让访达 / Spotlight 立即识别新应用(失败无妨,系统稍后也会自行索引)
+            lsregister = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+                          "LaunchServices.framework/Support/lsregister")
+            if os.path.exists(lsregister):
+                subprocess.run([lsregister, "-f", str(app)], capture_output=True, timeout=30)
+            return app
+        if IS_LINUX:
+            desk, icon_path = _linux_launcher_paths()
+            desk.parent.mkdir(parents=True, exist_ok=True)
+            icon_ref = "utilities-system-monitor"  # 没有 Pillow 时用主题自带图标
+            icon = _app_icon(256)
+            if icon is not None:
+                icon_path.parent.mkdir(parents=True, exist_ok=True)
+                icon.save(icon_path)
+                icon_ref = str(icon_path)
+            desk.write_text(
+                "[Desktop Entry]\nType=Application\nVersion=1.0\n"
+                f"Name=AI Usage Card\nName[zh]={APP_DISPLAY_NAME}\nName[zh_CN]={APP_DISPLAY_NAME}\n"
+                "GenericName=AI Usage Monitor\nGenericName[zh_CN]=AI 用量监视\n"
+                "Comment=Claude / Codex usage limits at a glance\n"
+                "Comment[zh_CN]=实时显示 Claude / Codex 用量限额\n"
+                f"Exec={_desktop_exec(argv, env)}\nPath={script_dir}\nIcon={icon_ref}\n"
+                "Terminal=false\nCategories=Utility;\nKeywords=Claude;Codex;usage;quota;用量;额度;\n"
+                "StartupNotify=false\n", encoding="utf-8")
+            return desk
+    except Exception:
+        return None
+    return None
+
+
+def uninstall_app() -> bool:
+    try:
+        if IS_MAC:
+            import shutil
+            app = _mac_app_path()
+            if app.exists():
+                shutil.rmtree(app)
+            return True
+        if IS_LINUX:
+            for f in _linux_launcher_paths():
+                f.unlink(missing_ok=True)
+            return True
+    except Exception:
+        return False
+    return False
 
 
 # ================= 展示辅助 =================
@@ -1278,6 +1423,10 @@ class _Wakeup:
     def active(self) -> bool:
         return self._w is not None
 
+    @property
+    def write_fd(self) -> int:
+        return self._w
+
     def notify(self) -> None:
         if self._w is not None:
             try:
@@ -1361,6 +1510,15 @@ class QuotaCard:
         self._stop = False
         self.cmd_q: queue.Queue = queue.Queue()
         self._wake = _Wakeup(self.root, self._drain_cmds)
+        self._show_req = False
+        if not IS_WIN:  # 再次启动(如点应用图标)时,新进程发 SIGUSR1 让本实例显示卡片
+            try:
+                import signal
+                signal.signal(signal.SIGUSR1, self._on_show_signal)
+                if self._wake.active:  # 信号到达时写一个字节进唤醒管道,主循环立刻醒来处理
+                    signal.set_wakeup_fd(self._wake.write_fd, warn_on_full_buffer=False)
+            except Exception:
+                pass
 
         self._place_window(cfg)
         self._bind_events()
@@ -1541,7 +1699,14 @@ class QuotaCard:
                 pass
         self._tick_id = self.root.after(0, self._tick)
 
+    def _on_show_signal(self, *_):
+        # 信号处理函数里只置标志位,不碰队列的锁 / Tk(避免重入);由 _drain_cmds 在主循环里处理
+        self._show_req = True
+
     def _drain_cmds(self):
+        if self._show_req:
+            self._show_req = False
+            self._show_card()
         try:
             while True:
                 cmd, payload = self.cmd_q.get_nowait()
@@ -2196,6 +2361,8 @@ class QuotaCard:
     def _show_card(self):
         if self._hidden_card:
             self.toggle_card()
+        else:
+            self.root.lift()
 
     def toggle_card(self):
         if self._hidden_card:
@@ -2221,6 +2388,12 @@ class QuotaCard:
             return
         self._stop = True
         self._refresh_evt.set()  # 让后台线程尽快结束等待
+        if not IS_WIN:
+            try:
+                import signal
+                signal.set_wakeup_fd(-1)
+            except Exception:
+                pass
         self._wake.close()
         self._flush_cfg()
         if self.tray:
@@ -2377,6 +2550,9 @@ def run_check():
     print("Codex 凭证:", CODEX_AUTH, "存在" if CODEX_AUTH.exists() else "不存在")
     print("User-Agent:", user_agent())
     print("开机自启:", "已开启" if autostart_enabled() else "未开启")
+    if IS_MAC or IS_LINUX:
+        where = _mac_app_path() if IS_MAC else _linux_launcher_paths()[0]
+        print("应用入口:", f"已创建({where})" if app_installed() else "未创建(./start.sh --install-app)")
     results = dict(_run_parallel({"Claude": fetch_claude, "Codex": fetch_codex}))
     for name in ("Claude", "Codex"):
         res = results[name]
@@ -2406,20 +2582,48 @@ def acquire_single_instance() -> bool:
             return True
         # mac / Linux:对配置目录下的锁文件加排他非阻塞锁
         import fcntl
-        try:
-            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            lock_path = CONFIG_DIR / ".quota_card.lock"
-        except Exception:
-            lock_path = Path.home() / ".quota_card.lock"
-        f = open(lock_path, "w")
+        f = open(_lock_path(), "a+")  # 不能用 "w":打开即截断,会抹掉持锁实例写进去的 PID
         try:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]  # fcntl 仅 Unix
         except OSError:
+            f.close()
             return False  # 已有实例持锁
+        f.seek(0)
+        f.truncate()
+        f.write(f"{os.getpid()} {_INSTANCE_TAG}\n")  # 供后来者唤出卡片(见 signal_running_instance)
+        f.flush()
         _SINGLETON_HANDLE = f  # 保持文件对象存活,进程退出自动释放锁
         return True
     except Exception:
         return True  # 出错时不阻止启动
+
+
+# 写进锁文件的标记:表示持锁实例会响应 SIGUSR1 唤出卡片。
+# 旧版本不写这个标记,不能给它发信号(SIGUSR1 的默认动作是终止进程)。
+_INSTANCE_TAG = "show-on-usr1"
+
+
+def _lock_path() -> Path:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        return CONFIG_DIR / ".quota_card.lock"
+    except Exception:
+        return Path.home() / ".quota_card.lock"
+
+
+def signal_running_instance() -> bool:
+    """mac/Linux:已有实例在运行时,让它把卡片显示出来(点应用图标时卡片可能正藏在托盘里)。"""
+    if IS_WIN:
+        return False
+    try:
+        import signal
+        parts = _lock_path().read_text(encoding="utf-8").split()
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1] == _INSTANCE_TAG:
+            os.kill(int(parts[0]), signal.SIGUSR1)
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _main(argv: list[str]) -> int:
@@ -2435,8 +2639,26 @@ def _main(argv: list[str]) -> int:
         ok = set_autostart(val == "on")
         print(("开机自启已开启" if val == "on" else "开机自启已关闭") if ok else "设置开机自启失败")
         return 0 if ok else 1
+    if "--install-app" in argv:
+        if IS_WIN:
+            print("Windows 上请直接双击 启动卡片.bat(可右键 → 发送到 → 桌面快捷方式)")
+            return 1
+        path = install_app()
+        if not path:
+            print("创建应用入口失败")
+            return 1
+        print(f"已创建应用入口:{path}")
+        print("可从 Spotlight / 启动台打开,或拖到 Dock" if IS_MAC else "可在应用菜单 / 活动搜索里找到「AI 用量卡片」")
+        return 0
+    if "--uninstall-app" in argv:
+        ok = uninstall_app()
+        print("已移除应用入口" if ok else "移除应用入口失败")
+        return 0 if ok else 1
     if not acquire_single_instance():
-        return 0  # 已有实例,直接退出,不重复弹卡片
+        # 已有实例在运行:不重复弹卡片,而是让它把卡片显示出来
+        if signal_running_instance():
+            print("已在运行:已把卡片调到前台")
+        return 0
     QuotaCard()
     return 0
 
