@@ -1782,7 +1782,7 @@ class QuotaCard:
             pystray.MenuItem("卡片移回屏幕", lambda *_: self._post("reset_pos")),
             pystray.MenuItem("退出", lambda *_: self._post("quit")),
         )
-        icon = self._tray_image(0, (70, 196, 106))
+        icon = self._tray_image(None)
         extra = {}
         ak = _appkit() if IS_MAC else None
         if ak:  # pystray 文档要求:与其它框架共用主循环时,传入对方(此处为 Tk)的 NSApplication
@@ -1808,26 +1808,35 @@ class QuotaCard:
         except Exception:
             self.tray = None
 
-    def _tray_image(self, util, rgb):
+    # 托盘位图里数字用的颜色:同色相的深色,保证在白底上清晰(卡片用的亮色在白底上对比度只有 ~2:1)
+    _TRAY_INK = {C_GREEN: (22, 128, 61), C_AMBER: (180, 95, 6), C_RED: (200, 30, 30)}
+
+    def _tray_image(self, util):
+        """托盘位图(Windows 任务栏 / Linux 托盘 / mac 无 PyObjC 时兜底)。
+           白色半透明圆角底 + 用量色纯数字(不带 %):黑底彩字在深色任务栏上对比度不足、
+           "%" 在 16~24px 的实际尺寸下几乎看不清,去掉后数字能放得更大(issue #3)。
+           以 128px 绘制,交给系统缩小显示更锐利(PR #1)。util=None 表示尚无数据。"""
         from PIL import Image, ImageDraw
-        sz = 64
+        sz, pad = 128, 4
+        if util is None:
+            ink, txt = (110, 110, 118), "–"
+        else:
+            ink, txt = self._TRAY_INK.get(bar_color(util), (40, 40, 40)), str(int(round(util)))
         img = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
-        # 背景几乎填满整张图(让托盘里看起来和别的图标一样大),用量色描边
-        d.rounded_rectangle([1, 1, sz - 2, sz - 2], radius=14,
-                            fill=(27, 28, 32, 255), outline=tuple(rgb) + (255,), width=4)
-        txt = f"{int(round(util))}%"
-        # 自适应字号:在留白内尽量放大
-        font = _tray_font(16)
-        for size in range(46, 14, -2):
+        d.rounded_rectangle([pad, pad, sz - pad - 1, sz - pad - 1], radius=int(sz * 0.22),
+                            fill=(255, 255, 255, 230), outline=ink + (255,), width=int(sz * 0.05))
+        max_w, max_h = int(sz * 0.80), int(sz * 0.66)  # 自适应字号:在描边内尽量放大
+        font = _tray_font(int(sz * 0.4))
+        for size in range(int(sz * 0.8), 16, -2):
             cand = _tray_font(size)
             bb = d.textbbox((0, 0), txt, font=cand)
-            if bb[2] - bb[0] <= sz - 12 and bb[3] - bb[1] <= sz - 18:
+            if bb[2] - bb[0] <= max_w and bb[3] - bb[1] <= max_h:
                 font = cand
                 break
         bb = d.textbbox((0, 0), txt, font=font)
         tw, th = bb[2] - bb[0], bb[3] - bb[1]
-        d.text(((sz - tw) / 2 - bb[0], (sz - th) / 2 - bb[1]), txt, font=font, fill=tuple(rgb) + (255,))
+        d.text(((sz - tw) / 2 - bb[0], (sz - th) / 2 - bb[1]), txt, font=font, fill=ink + (255,))
         return img
 
     def _update_tray(self, secs=None):
@@ -1850,7 +1859,7 @@ class QuotaCard:
             if self._mac_text_tray and not self._mac_status_title(text, rgb):
                 self._mac_text_tray = False  # 菜单栏文字不可用 → 永久退回位图图标
             if not self._mac_text_tray:
-                self.tray.icon = self._tray_image(util, rgb)
+                self.tray.icon = self._tray_image(util)
             self.tray.title = tip
         except Exception:
             pass
