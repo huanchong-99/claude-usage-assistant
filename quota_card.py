@@ -324,10 +324,37 @@ def _appkit():
 # safeStorage 加密后存进其 config.json。只要读它,卡片就永远有一份"活着"的令牌,
 # 无需终端 claude 登录——这正是"只用桌面版、CLI 令牌总过期"场景的根治办法。
 # 全过程只读、best-effort:任何一步失败都静默跳过,回退到 CLI 凭证文件路径。
+def _win_desktop_dirs() -> list[Path]:
+    """Windows 上桌面版可能的数据目录:
+         · 微软商店(MSIX)版:%LOCALAPPDATA%\\Packages\\Claude_<发布者哈希>\\LocalCache\\Roaming\\Claude
+           (MSIX 把应用对 %APPDATA% 的写入重定向到包目录里,见 issue #2)
+         · 经典安装包版:%APPDATA%\\Claude"""
+    out: list[Path] = []
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        try:
+            for pkg in sorted((Path(local) / "Packages").glob("Claude_*")):
+                out.append(pkg / "LocalCache" / "Roaming" / "Claude")
+        except OSError:
+            pass
+    base = os.environ.get("APPDATA")
+    if base:
+        out.append(Path(base) / "Claude")
+    return out
+
+
 def _desktop_dir() -> Path | None:
     if IS_WIN:
-        base = os.environ.get("APPDATA")
-        return Path(base) / "Claude" if base else None
+        dirs = _win_desktop_dirs()
+        found = []
+        for d in dirs:
+            try:
+                found.append(((d / "config.json").stat().st_mtime, d))
+            except OSError:
+                continue
+        if found:  # 两种版本都装过时,取 config.json 最近更新的那个(正在用的那个)
+            return max(found, key=lambda it: it[0])[1]
+        return dirs[-1] if dirs else None
     if IS_MAC:
         return Path.home() / "Library" / "Application Support" / "Claude"
     return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "Claude"
@@ -482,22 +509,20 @@ def _cbc_decrypt(key: bytes, iv: bytes, ct: bytes) -> bytes | None:
     return pt[:-pad] if 1 <= pad <= 16 else pt
 
 
-_ss_key_cache = 0  # 0=未尝试;None=尝试过但不可用;(key, algo)=已缓存
+_ss_key_cache: dict = {}  # {数据目录: (key, algo) 或 None(尝试过但不可用)}
 
 
-def _safestorage_key():
-    """返回 (aes_key, 'gcm'|'cbc') 或 None。密钥在一个进程内稳定,缓存一次即可
+def _safestorage_key(d: Path):
+    """返回 (aes_key, 'gcm'|'cbc') 或 None。密钥在一个进程内稳定,按数据目录缓存一次即可
        (避免每 60 秒刷新都读一次 Local State / mac 钥匙串反复弹授权框)。"""
-    global _ss_key_cache
-    if _ss_key_cache != 0:
-        return _ss_key_cache
-    _ss_key_cache = _compute_safestorage_key()
-    return _ss_key_cache
+    k = str(d)
+    if k not in _ss_key_cache:
+        _ss_key_cache[k] = _compute_safestorage_key(d)
+    return _ss_key_cache[k]
 
 
-def _compute_safestorage_key():
+def _compute_safestorage_key(d: Path):
     """Windows=DPAPI 解出的 32 字节 GCM 密钥;mac/Linux=PBKDF2 派生 16 字节 CBC 密钥。"""
-    d = _desktop_dir()
     if not d:
         return None
     if IS_WIN:
@@ -562,7 +587,7 @@ def _claude_desktop_tokens() -> list[dict]:
         st = cfg_path.stat()
     except OSError:
         return []
-    stamp = (st.st_mtime_ns, st.st_size)
+    stamp = (str(cfg_path), st.st_mtime_ns, st.st_size)
     if stamp != _desk_cache["stamp"]:
         _desk_cache["tokens"] = _read_desktop_tokens(cfg_path)
         _desk_cache["stamp"] = stamp
@@ -578,7 +603,7 @@ def _read_desktop_tokens(cfg_path: Path) -> list[dict]:
     encs = [e for e in encs if isinstance(e, str) and e]
     if not encs:  # 没有令牌缓存就别去取密钥(mac 上取密钥会弹钥匙串授权框)
         return []
-    keyinfo = _safestorage_key()
+    keyinfo = _safestorage_key(cfg_path.parent)
     if not keyinfo:
         return []
     merged: dict = {}
@@ -2268,7 +2293,9 @@ def _env_report() -> list[str]:
         if not cipher:
             cipher = "系统 CommonCrypto" if IS_MAC else "不可用(pip install cryptography)"
     d = _desktop_dir()
-    desk = "已安装" if d and (d / "config.json").exists() else "未找到"
+    desk = "未找到"
+    if d and (d / "config.json").exists():
+        desk = "已安装(微软商店版)" if IS_WIN and "Packages" in d.parts else "已安装"
     lines.append(f"Claude 桌面版: {desk} · 令牌解密: {cipher}")
     return lines
 

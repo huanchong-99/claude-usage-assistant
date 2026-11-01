@@ -44,7 +44,7 @@ The card only uses the login state **already on your machine**, picking whicheve
 
 **Claude** (cheapest valid source first):
 1. **CLI credential** `~/.claude/.credentials.json` (or the **macOS Keychain**) — used as-is while it's valid; cached in memory, so a refresh costs one `stat`.
-2. **Desktop-app token** — reads the OAuth cache in the Claude desktop app / Cowork `config.json` and **decrypts it locally** with the OS's own crypto: Windows DPAPI + BCrypt, macOS CommonCrypto (both via pure `ctypes`, no extra dependency); Linux needs `cryptography`. The desktop app keeps this refreshed, so it's **always alive** — this is what makes "refreshes even when you only use the desktop app" work.
+2. **Desktop-app token** — reads the OAuth cache in the Claude desktop app / Cowork `config.json` (classic installer or **Microsoft Store / MSIX** build on Windows) and **decrypts it locally** with the OS's own crypto: Windows DPAPI + BCrypt, macOS CommonCrypto (both via pure `ctypes`, no extra dependency); Linux needs `cryptography`. The desktop app keeps this refreshed, so it's **always alive** — this is what makes "refreshes even when you only use the desktop app" work.
 3. **Auto-refresh** — if neither is valid, the CLI credential is **refreshed via its refreshToken and written back** (atomic write, `0600` perms; Keychain writes go through `security -i` on stdin so the token never shows up in the process list).
 
 **Codex:** reads `~/.codex/auth.json` (ChatGPT login mode); when near expiry or rejected, **auto-refreshes via its refreshToken and writes it back**.

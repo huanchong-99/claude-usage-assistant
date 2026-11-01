@@ -44,7 +44,7 @@
 
 **Claude**(按开销从低到高,取第一份有效的):
 1. **CLI 凭证** `~/.claude/.credentials.json`(或 **macOS 钥匙串**)—— 有效期内直接用;内存缓存,每次刷新只需一次 `stat`。
-2. **桌面版令牌** —— 读 Claude 桌面版 / Cowork 的 `config.json` 里的 OAuth 缓存,用**系统自带加解密就地解密**:Windows 用 DPAPI + BCrypt,macOS 用 CommonCrypto(均为纯 `ctypes`、无额外依赖);Linux 需装 `cryptography`。桌面版会自己不断续期,所以这份**永远是活的**——这正是"只用桌面版也能刷新"的关键。
+2. **桌面版令牌** —— 读 Claude 桌面版 / Cowork 的 `config.json` 里的 OAuth 缓存(Windows 上经典安装版与**微软商店 / MSIX 版**均支持),用**系统自带加解密就地解密**:Windows 用 DPAPI + BCrypt,macOS 用 CommonCrypto(均为纯 `ctypes`、无额外依赖);Linux 需装 `cryptography`。桌面版会自己不断续期,所以这份**永远是活的**——这正是"只用桌面版也能刷新"的关键。
 3. **自动续期** —— 两者都不可用时,**用 refreshToken 续期 CLI 凭证并写回**(原子写、`0600` 权限;写回钥匙串时经 `security -i` 的标准输入传递,令牌不会出现在进程列表里)。
 
 **Codex:** 读 `~/.codex/auth.json`(ChatGPT 登录模式),临期或被拒时**自动用 refreshToken 续期并写回**。
