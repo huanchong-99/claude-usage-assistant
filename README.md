@@ -118,10 +118,11 @@ Create a launcher you can open like any other app:
 ./start.sh --install-app        # --uninstall-app to remove
 ```
 
-- **macOS:** creates `~/Applications/AI 用量卡片.app` — open it from **Spotlight** or **Launchpad**, or drag it to the **Dock**.
+- **macOS:** creates `/Applications/AI 用量卡片.app` — open it from **Spotlight** or **Launchpad**, or drag it to the **Dock**. It builds a small native launcher using Apple's Command Line Tools (`xcode-select --install` if missing), reusing your current Python library and venv without copying them. If `/Applications` is not writable, it uses `~/Applications` and prints a warning.
 - **Linux:** adds **AI Usage Card** (AI 用量卡片) with an icon to your application menu / Activities search.
 - Opening it while the card is already running brings the card back (even when it's hidden to the tray) instead of starting a second copy.
 - It records the current Python and project path — if you move the folder or switch Python, run it again.
+- On macOS 27 with Thaw, the native app in `/Applications` keeps the menu bar percentage visible. The previous shell launcher left the UI in an unbundled Python process, which Thaw could hide even in its Visible section ([upstream report](https://github.com/thaw-app/Thaw/issues/1374)). Reinstall the launcher, quit the old card, and open the app; restart Thaw once if it has not discovered the new app. `start.sh`, the double-click launcher, and enabled autostart then use the native app too. A user-level fallback may still have this Thaw limitation.
 
 Verify the data pull without opening the UI (add `--check`):
 

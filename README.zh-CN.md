@@ -118,10 +118,11 @@ uv pip install --python .venv/bin/python --no-cache --only-binary :all: -r requi
 ./start.sh --install-app        # 移除用 --uninstall-app
 ```
 
-- **macOS:** 生成 `~/Applications/AI 用量卡片.app`——可从 **Spotlight**、**启动台** 打开,或拖到 **Dock**。
+- **macOS:** 生成 `/Applications/AI 用量卡片.app`——可从 **Spotlight**、**启动台** 打开,或拖到 **Dock**。使用 Apple Command Line Tools 编译小型原生启动器(缺少时运行 `xcode-select --install`),复用当前 Python 动态库和虚拟环境,不复制整套运行环境。没有 `/Applications` 写权限时使用 `~/Applications`,并显示提示。
 - **Linux:** 在应用菜单 / 活动搜索里加入带图标的 **AI 用量卡片**。
 - 卡片已在运行时再次打开,会把卡片调到前台(即使它正藏在托盘里),不会启动第二份。
 - 入口记录的是当前的 Python 和项目路径——移动了项目文件夹或换了 Python,重新运行一次即可。
+- **macOS 27 + Thaw:** 安装到 `/Applications` 的原生应用可保留菜单栏百分比。旧版 shell 入口实际运行的是应用包外的 Python,即使在 Thaw 的“显示”区也可能消失([上游问题](https://github.com/thaw-app/Thaw/issues/1374))。重新安装入口、退出旧卡片后打开应用;Thaw 尚未识别新应用时重启一次 Thaw。此后 `start.sh`、双击启动和已开启的开机自启都会使用原生入口。`~/Applications` 的后备安装仍可能受此限制影响。
 
 不开界面、仅拉取一次数据自检(加 `--check`):
 

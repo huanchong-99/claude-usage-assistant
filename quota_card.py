@@ -29,7 +29,7 @@ Claude / Codex 实时限额卡片  (quota_card.py)
 命令行:
   --check            不开界面,只拉一次数据并打印诊断信息
   --autostart on|off 开启 / 关闭开机自启(Windows 注册表 Run / macOS LaunchAgent / Linux autostart)
-  --install-app      创建应用入口:macOS 为 ~/Applications 里的 .app,Linux 为应用菜单启动项
+  --install-app      创建应用入口:macOS 为 /Applications 里的 .app,Linux 为应用菜单启动项
   --uninstall-app    移除应用入口
 """
 from __future__ import annotations
@@ -1055,8 +1055,8 @@ FETCHERS = {"claude": fetch_claude, "codex": fetch_codex}
 
 
 # ================= 开机自启 =================
-def _launch_argv() -> list[str]:
-    """自启动命令:就用当前这个解释器(装好依赖的那个)+ 本脚本的绝对路径。"""
+def _python_argv() -> list[str]:
+    """当前解释器(保留 venv 路径)与脚本。"""
     # 只转绝对路径、不解析符号链接:venv 里的 python 是指向系统解释器的链接,解析后会丢掉 venv 的依赖
     exe = os.path.abspath(sys.executable) if sys.executable else "python3"
     if IS_WIN:
@@ -1064,6 +1064,12 @@ def _launch_argv() -> list[str]:
         if pyw.exists():
             exe = str(pyw)
     return [exe, str(Path(__file__).resolve())]
+
+
+def _launch_argv() -> list[str]:
+    """已安装的 mac 原生入口也用于自启,保持菜单栏宿主的应用身份。"""
+    native = _installed_mac_launcher() if IS_MAC else None
+    return [str(native)] if native else _python_argv()
 
 
 def _autostart_file() -> Path | None:
@@ -1174,7 +1180,56 @@ def _app_icon(size: int = 1024):
 
 
 def _mac_app_path() -> Path:
-    return Path.home() / "Applications" / f"{APP_DISPLAY_NAME}.app"
+    # macOS 27 + Thaw can omit apps outside /Applications from its allowed set.
+    # Keep the user-level fallback for machines without write access; never sudo.
+    base = Path("/Applications")
+    if not os.access(base, os.W_OK):
+        base = Path.home() / "Applications"
+    return base / f"{APP_DISPLAY_NAME}.app"
+
+
+def _mac_app_paths() -> list[Path]:
+    return [Path("/Applications") / f"{APP_DISPLAY_NAME}.app",
+            Path.home() / "Applications" / f"{APP_DISPLAY_NAME}.app"]
+
+
+def _mac_app_info(app: Path) -> dict:
+    import plistlib
+    try:
+        info = plistlib.loads((app / "Contents" / "Info.plist").read_bytes())
+        if isinstance(info, dict) and info.get("CFBundleIdentifier") == LAUNCH_AGENT_LABEL + ".launcher":
+            return info
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def _installed_mac_launcher() -> Path | None:
+    python, script = _python_argv()
+    for app in _mac_app_paths():
+        info = _mac_app_info(app)
+        exe = app / "Contents" / "MacOS" / "launcher"
+        if (info.get("AIUsageNativeLauncher") == 1 and info.get("AIUsagePython") == python
+                and info.get("AIUsageScript") == script and os.access(exe, os.X_OK)
+                and Path(info.get("AIUsagePythonLibrary", "")).is_file()):
+            return exe
+    return None
+
+
+def _mac_python_library() -> Path:
+    import sysconfig
+    # Framework Python (python.org / some Homebrew builds) and standalone Python.
+    framework = sysconfig.get_config_var("PYTHONFRAMEWORK")
+    candidates = []
+    if framework:
+        candidates.append(Path(sys.base_prefix) / framework)
+    libdir, name = sysconfig.get_config_var("LIBDIR"), sysconfig.get_config_var("LDLIBRARY")
+    if libdir and name:
+        candidates.append(Path(libdir) / name)
+    for lib in candidates:
+        if lib.is_file() and (lib.suffix == ".dylib" or lib.name == framework):
+            return lib.resolve()
+    raise RuntimeError("没有找到当前 Python 的动态运行库;请使用 python.org、Homebrew 或 uv 的 Python")
 
 
 def _linux_launcher_paths() -> tuple[Path, Path]:
@@ -1185,7 +1240,7 @@ def _linux_launcher_paths() -> tuple[Path, Path]:
 
 def app_installed() -> bool:
     if IS_MAC:
-        return _mac_app_path().exists()
+        return any(_mac_app_info(app) for app in _mac_app_paths())
     if IS_LINUX:
         return _linux_launcher_paths()[0].exists()
     return False
@@ -1193,53 +1248,71 @@ def app_installed() -> bool:
 
 def install_app() -> Path | None:
     """生成应用入口,返回其路径(失败 / 不支持返回 None)。重复执行会覆盖更新(如项目换了位置)。
-         macOS:~/Applications/AI 用量卡片.app —— 可从 Spotlight / 启动台打开、拖进 Dock
+         macOS:/Applications/AI 用量卡片.app —— 可从 Spotlight / 启动台打开、拖进 Dock
          Linux:~/.local/share/applications/ai-usage-card.desktop —— 出现在应用菜单 / 活动搜索里
        入口记录的是当前解释器 + 本脚本路径(与开机自启相同),用哪个 Python 运行本命令就用哪个启动。"""
-    argv, env = _launch_argv(), _passthrough_env()
+    argv, env = _python_argv(), _passthrough_env()
     script_dir = str(Path(__file__).resolve().parent)
     try:
         if IS_MAC:
             import plistlib
-            import shlex
             import shutil
             import subprocess
+            import tempfile
             app = _mac_app_path()
-            if app.exists():
-                shutil.rmtree(app)
-            macos_dir, res_dir = app / "Contents" / "MacOS", app / "Contents" / "Resources"
-            macos_dir.mkdir(parents=True)
-            res_dir.mkdir(parents=True)
-            exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items())
-            alert = ("display alert \"" + APP_DISPLAY_NAME + "\" message \"找不到程序或 Python 解释器(项目目录"
-                     "可能已移动)。请在项目目录重新运行:./start.sh --install-app\"")
-            launcher = macos_dir / "launcher"
-            # 启动器只负责在后台拉起程序然后立刻退出:卡片进程自己管理 Dock / 菜单栏图标
-            launcher.write_text(
-                "#!/bin/sh\n"
-                "# 由 quota_card.py --install-app 生成;项目目录或 Python 变了,重新运行一次 --install-app 即可\n"
-                f"{exports}"
-                f"if [ ! -f {shlex.quote(argv[1])} ] || [ ! -x {shlex.quote(argv[0])} ]; then\n"
-                f"  osascript -e {shlex.quote(alert)} >/dev/null 2>&1\n"
-                "  exit 1\n"
-                "fi\n"
-                f"cd {shlex.quote(script_dir)} || exit 1\n"
-                f"nohup {' '.join(shlex.quote(a) for a in argv)} >/dev/null 2>&1 &\n", encoding="utf-8")
-            launcher.chmod(0o755)
+            if app.exists() and not _mac_app_info(app):
+                raise RuntimeError(f"同名应用不属于本项目,未覆盖:{app}")
+            library = _mac_python_library()
+            # Probe CLT without triggering Apple's install dialog on machines without it.
+            if subprocess.run(["/usr/bin/xcode-select", "-p"], capture_output=True).returncode:
+                raise RuntimeError("创建 macOS 原生入口需要 Command Line Tools: xcode-select --install")
             info = {"CFBundleName": APP_DISPLAY_NAME, "CFBundleDisplayName": APP_DISPLAY_NAME,
                     "CFBundleIdentifier": LAUNCH_AGENT_LABEL + ".launcher", "CFBundleExecutable": "launcher",
-                    "CFBundlePackageType": "APPL", "CFBundleShortVersionString": "1.0", "CFBundleVersion": "1",
-                    "LSUIElement": True, "LSMinimumSystemVersion": "10.13", "NSHighResolutionCapable": True}
-            icon = _app_icon(1024)
-            if icon is not None:
-                icon.save(res_dir / "AppIcon.icns")
-                info["CFBundleIconFile"] = "AppIcon"
-            (app / "Contents" / "Info.plist").write_bytes(plistlib.dumps(info))
+                    "CFBundlePackageType": "APPL", "CFBundleShortVersionString": "1.1", "CFBundleVersion": "2",
+                    "LSUIElement": True, "LSMinimumSystemVersion": "10.13", "NSHighResolutionCapable": True,
+                    "AIUsageNativeLauncher": 1, "AIUsagePython": argv[0], "AIUsageScript": argv[1],
+                    "AIUsagePythonLibrary": str(library), "AIUsageEnvironment": env}
+            app.parent.mkdir(parents=True, exist_ok=True)
+            # Build completely before replacing a working launcher. Keep a rollback copy
+            # only for the duration of this operation, including compiler/cache cleanup.
+            with tempfile.TemporaryDirectory(prefix=".ai-usage-install-", dir=app.parent) as tmp:
+                stage = Path(tmp) / app.name
+                macos_dir, res_dir = stage / "Contents" / "MacOS", stage / "Contents" / "Resources"
+                macos_dir.mkdir(parents=True)
+                res_dir.mkdir(parents=True)
+                subprocess.run(["/usr/bin/clang", "-Os", "-fobjc-arc", "-framework", "AppKit",
+                                "-fmodules-cache-path=" + str(Path(tmp) / "clang-cache"),
+                                str(Path(__file__).with_name("macos_launcher.m")),
+                                "-o", str(macos_dir / "launcher")], check=True, capture_output=True, timeout=60)
+                icon = _app_icon(1024)
+                if icon is not None:
+                    icon.save(res_dir / "AppIcon.icns")
+                    info["CFBundleIconFile"] = "AppIcon"
+                (stage / "Contents" / "Info.plist").write_bytes(plistlib.dumps(info))
+                backup = Path(tmp) / "previous.app"
+                if app.exists():
+                    app.rename(backup)
+                try:
+                    stage.rename(app)
+                except OSError:
+                    if backup.exists():
+                        backup.rename(app)
+                    raise
             # 让访达 / Spotlight 立即识别新应用(失败无妨,系统稍后也会自行索引)
             lsregister = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/"
                           "LaunchServices.framework/Support/lsregister")
             if os.path.exists(lsregister):
                 subprocess.run([lsregister, "-f", str(app)], capture_output=True, timeout=30)
+            # Migrate the old user-level shell launcher after the native app is ready.
+            for old in _mac_app_paths():
+                if old != app and _mac_app_info(old):
+                    if os.path.exists(lsregister):
+                        subprocess.run([lsregister, "-u", str(old)], capture_output=True, timeout=30)
+                    shutil.rmtree(old)
+            if autostart_enabled() and not set_autostart(True):
+                print("提示:应用已更新,但请重新设置开机自启", file=sys.stderr)
+            if app.parent != Path("/Applications"):
+                print("提示:无 /Applications 写权限,已使用 ~/Applications;macOS 27 + Thaw 可能仍隐藏入口", file=sys.stderr)
             return app
         if IS_LINUX:
             desk, icon_path = _linux_launcher_paths()
@@ -1260,7 +1333,8 @@ def install_app() -> Path | None:
                 "Terminal=false\nCategories=Utility;\nKeywords=Claude;Codex;usage;quota;用量;额度;\n"
                 "StartupNotify=false\n", encoding="utf-8")
             return desk
-    except Exception:
+    except Exception as exc:
+        print(f"创建应用入口失败:{exc}", file=sys.stderr)
         return None
     return None
 
@@ -1269,9 +1343,12 @@ def uninstall_app() -> bool:
     try:
         if IS_MAC:
             import shutil
-            app = _mac_app_path()
-            if app.exists():
-                shutil.rmtree(app)
+            for app in _mac_app_paths():
+                if _mac_app_info(app):
+                    shutil.rmtree(app)
+            # An enabled LaunchAgent must not keep pointing at the removed app.
+            if autostart_enabled():
+                return set_autostart(True)
             return True
         if IS_LINUX:
             for f in _linux_launcher_paths():
@@ -2814,6 +2891,12 @@ def _main(argv: list[str]) -> int:
         if signal_running_instance():
             print("已在运行:已把卡片调到前台")
         return 0
+    if IS_MAC and not os.environ.get("QUOTA_CARD_NATIVE_APP"):
+        native = _installed_mac_launcher()
+        if native:
+            # exec releases the close-on-exec instance lock. The native process
+            # reacquires it and keeps the same Python environment and script.
+            os.execv(str(native), [str(native), *argv])
     QuotaCard()
     return 0
 
