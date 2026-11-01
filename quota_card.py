@@ -21,7 +21,7 @@ Claude / Codex 实时限额卡片  (quota_card.py)
   · 拖动卡片移动(记忆位置)
   · 滚轮缩放 / 拖动窗口边缘缩放 / 右键菜单选档位
   · Ctrl+滚轮 微调不透明度(macOS 上 ⌘+滚轮 亦可)
-  · 顶部按钮:▲=置顶  ≡=菜单  ↻=刷新  ✕=退出
+  · 顶部按钮:▲=置顶  ≡=菜单  ↻=刷新  ✕=退出(macOS:左上角红绿灯,红=退出、黄=隐藏到菜单栏)
   · 右键空白处 或 点 ≡ = 打开菜单(macOS:双指轻点 / Control+单击 亦可)
   · 托盘图标:默认显示 Claude 5 小时用量(可在菜单切换);左键单击=显示/隐藏卡片
     (Linux 原生托盘:中键=立即刷新;macOS:菜单栏直接显示彩色百分比,点击弹出菜单)
@@ -1475,6 +1475,10 @@ class QuotaCard:
         self.root.title("AI 用量")
         _resolve_font(self.root)
         self.root.overrideredirect(True)
+        try:  # 尺寸只由卡片自己管理(边缘拖动 / 滚轮 = 缩放),不让系统直接拉伸窗口
+            self.root.resizable(False, False)
+        except Exception:
+            pass
         self.root.attributes("-topmost", self.pinned)
         canvas_bg = self._setup_transparency()
         try:
@@ -1484,6 +1488,12 @@ class QuotaCard:
 
         self._cur_w = self._cur_h = -1
         self._pos = (0, 0)
+        self._native_titlebar = False  # macOS 上无边框没生效、只能保留系统标题栏时为 True
+        self._lights_hover = False     # 鼠标是否悬停在红绿灯上(悬停时显示 × / −)
+        self._lights_box = None
+        self._cfg_after = None         # 外部改尺寸的防抖定时器
+        self._cfg_ready = False        # 启动初期的 Configure 事件不处理
+        self._last_forced = None
         self.canvas = tk.Canvas(self.root, bg=canvas_bg, highlightthickness=0,
                                 width=self.s(BW), height=self.s(120))
         self.canvas.pack(fill="both", expand=True)
@@ -1522,6 +1532,8 @@ class QuotaCard:
 
         self._place_window(cfg)
         self._bind_events()
+        self.root.protocol("WM_DELETE_WINDOW", self.quit)  # 系统关闭按钮(如有)也走保存退出
+        self.root.after(800, lambda: setattr(self, "_cfg_ready", True))
 
         self.tray = None
         self._tray_sig = None
@@ -1576,7 +1588,8 @@ class QuotaCard:
         cv.bind("<B1-Motion>", self._on_drag)
         cv.bind("<ButtonRelease-1>", self._on_release)
         cv.bind("<Motion>", self._on_motion)
-        cv.bind("<Leave>", lambda *_: self._set_cursor(""))
+        cv.bind("<Leave>", self._on_leave)
+        self.root.bind("<Configure>", self._on_configure)
         # 右键菜单:mac 上 Tk 8.6 的右键 / 双指轻点是 Button-2(8.7+ 才统一为 Button-3),
         # 另按 mac 习惯支持 Control+单击
         for seq in (("<Button-3>", "<Button-2>", "<Control-Button-1>") if IS_MAC else ("<Button-3>",)):
@@ -1605,7 +1618,76 @@ class QuotaCard:
                         ak.NSApplicationActivationPolicyAccessory)
                 except Exception:
                     pass
-        r.after(300, self._mac_apply_window_flags)
+        r.after(300, self._mac_after_map)
+
+    def _mac_after_map(self):
+        """窗口显示出来之后:确认真的是无边框(否则自愈)、设置跨桌面行为、补回置顶。"""
+        self._mac_fix_titlebar(0)
+
+    def _titlebar_height(self) -> int:
+        """窗口实际带着多高的系统标题栏(0 = 无边框,正常)。优先问 AppKit,没有 PyObjC 就用 Tk 坐标推算:
+           wm geometry 给的是外框左上角,winfo_rooty 是内容区顶部,二者之差就是标题栏高度。"""
+        ak = _appkit()
+        if ak:
+            try:
+                for w in ak.NSApplication.sharedApplication().windows() or []:
+                    if str(w.className()).startswith("TK") and w.isVisible():
+                        fr = w.frame()
+                        return int(round(fr.size.height - w.contentRectForFrameRect_(fr).size.height))
+            except Exception:
+                pass
+        try:
+            import re
+            self.root.update_idletasks()
+            m = re.search(r"[+-](-?\d+)[+-](-?\d+)$", self.root.geometry())
+            return max(0, self.root.winfo_rooty() - int(m.group(2))) if m else 0
+        except Exception:
+            return 0
+
+    def _mac_fix_titlebar(self, attempt: int):
+        """个别 Python / Tk 组合下 overrideredirect 没生效,窗口带着系统标题栏和红绿灯(与卡片自己的按钮重复)。
+           逐级自愈:① 用 Tk 自己的接口重新去掉标题栏(会同步 Tk 的几何信息);② AppKit 直接改窗口样式;
+           ③ 仍去不掉就保留系统标题栏,卡片里不再画重复的红绿灯。"""
+        if self._stop or self._hidden_card:
+            return
+        if self._titlebar_height() <= 4:
+            changed = self._native_titlebar
+            self._native_titlebar = False
+            self._mac_finish_window_setup(redraw=changed)
+            return
+        if attempt == 0:
+            try:
+                self.root.overrideredirect(False)
+                self.root.overrideredirect(True)
+            except Exception:
+                pass
+        elif attempt == 1:
+            ak = _appkit()
+            try:
+                for w in (ak.NSApplication.sharedApplication().windows() or []) if ak else []:
+                    if str(w.className()).startswith("TK"):
+                        w.setStyleMask_(int(w.styleMask()) & ~1)  # 去掉 NSWindowStyleMaskTitled
+                x, y = self._cur_pos()
+                self.root.geometry(f"{self._cur_w}x{self._cur_h}+{x}+{y}")  # 让 Tk 重新同步窗口几何
+            except Exception:
+                pass
+        else:
+            if not self._native_titlebar:
+                print("macOS:无法去掉系统标题栏,已改用系统标题栏(可运行 ./start.sh --check 查看 Python / Tk 版本)",
+                      file=sys.stderr)
+            self._native_titlebar = True
+            self._mac_finish_window_setup(redraw=True)
+            return
+        self.root.after(200, lambda: self._mac_fix_titlebar(attempt + 1))
+
+    def _mac_finish_window_setup(self, redraw: bool):
+        try:  # Tk 在去掉标题栏时会清掉自己的置顶标志,这里补回
+            self.root.attributes("-topmost", self.pinned)
+        except Exception:
+            pass
+        self._mac_apply_window_flags()
+        if redraw:
+            self.render(force=True)
 
     def _mac_apply_window_flags(self):
         """置顶时让卡片出现在所有桌面(Spaces)并可浮在全屏 App 之上;取消置顶则恢复默认。"""
@@ -1811,21 +1893,29 @@ class QuotaCard:
 
         # 头部:单数据源沿用旧样式(标题+套餐徽标);多数据源标题改为 AI 用量,徽标移到各分节
         hy = PAD + self.s(11)
-        cv.create_oval(PAD, hy - self.s(4), PAD + self.s(8), hy + self.s(4), fill=C_ACCENT, outline="")
+        self._lights_box = None
+        if IS_MAC and not self._native_titlebar:
+            # macOS:关闭按钮按系统习惯放在左上角,画成红绿灯(右上角不再有 Windows 式的 ✕)
+            title_x = self._draw_traffic_lights(cv, PAD, hy) + self.s(12)
+        else:
+            cv.create_oval(PAD, hy - self.s(4), PAD + self.s(8), hy + self.s(4), fill=C_ACCENT, outline="")
+            title_x = PAD + self.s(16)
         if not multi and secs:
             title, badge = f"{PROVIDER_TITLES[secs[0]['p']]} 用量", secs[0]["plan"]
         else:
             title, badge = "AI 用量", None
-        tid = cv.create_text(PAD + self.s(16), hy, text=title, anchor="w",
+        tid = cv.create_text(title_x, hy, text=title, anchor="w",
                              fill=C_TITLE, font=self.f(15, "bold"))
         if badge:
             self._draw_badge(cv, cv.bbox(tid)[2] + self.s(8), hy, badge)
-        # 顶部按钮(统一尺寸 + 统一线条风格,从右往左):关闭 / 刷新 / 菜单 / 图钉
+        # 顶部按钮(统一尺寸 + 统一线条风格,从右往左):关闭 / 刷新 / 菜单 / 图钉;macOS 的关闭在左侧红绿灯里
         ri = self.s(7)
         sw = max(2, int(round(1.7 * SCALE * self.zoom)))
         cx = W - PAD - self.s(6)
-        for kind, cb in (("close", self.quit), ("refresh", self.refresh_now),
-                         ("menu", self.open_menu), ("top", self.toggle_pin)):
+        icons = (("refresh", self.refresh_now), ("menu", self.open_menu), ("top", self.toggle_pin))
+        if not IS_MAC:
+            icons = (("close", self.quit),) + icons
+        for kind, cb in icons:
             col = (C_ACCENT if self.pinned else C_SUB) if kind == "top" else C_SUB
             self._draw_icon(cv, kind, cx, hy, ri, sw, col)
             r = self.s(11)
@@ -1856,6 +1946,39 @@ class QuotaCard:
                 y += MSG
 
         self._draw_footer(cv, W, H, PAD, secs)
+
+    # (按钮, 填充色, 描边色, 悬停符号色)——与 macOS 系统红绿灯一致
+    _LIGHTS = {"close": ("#ff5f57", "#e0443e", "#4d0000"), "min": ("#febc2e", "#dea123", "#995700")}
+
+    def _draw_traffic_lights(self, cv, x0, cy) -> int:
+        """macOS 风格红绿灯:红 = 关闭(退出),黄 = 隐藏到菜单栏(没有菜单栏图标时置灰)。
+           直径 12、圆心距 20,与系统一致;鼠标悬停在这组按钮上时才显示 × / − 符号。返回右边界 x。"""
+        r, step = self.s(6), self.s(20)
+        lw = max(1, int(round(1.3 * SCALE * self.zoom)))
+        glyph_state = "normal" if self._lights_hover else "hidden"
+        x = x0 + r
+        for kind, cb, enabled in (("close", self.quit, True), ("min", self.toggle_card, bool(self.tray))):
+            fill, edge, ink = self._LIGHTS[kind] if enabled else ("#4b4d55", "#4b4d55", None)
+            cv.create_oval(x - r, cy - r, x + r, cy + r, fill=fill, outline=edge)
+            if enabled:
+                g = r * 0.45
+                if kind == "close":
+                    cv.create_line(x - g, cy - g, x + g, cy + g, fill=ink, width=lw, tags="light_glyph", state=glyph_state)
+                    cv.create_line(x - g, cy + g, x + g, cy - g, fill=ink, width=lw, tags="light_glyph", state=glyph_state)
+                else:
+                    cv.create_line(x - g * 1.15, cy, x + g * 1.15, cy, fill=ink, width=lw, tags="light_glyph", state=glyph_state)
+                hit = r + self.s(3)
+                self._buttons.append((x - hit, cy - hit, x + hit, cy + hit, cb))
+            x += step
+        right = x - step + r
+        pad = self.s(4)
+        self._lights_box = (x0 - pad, cy - r - pad, right + pad, cy + r + pad)
+        return right
+
+    def _set_lights_hover(self, on: bool):
+        if on != self._lights_hover:
+            self._lights_hover = on
+            self.canvas.itemconfigure("light_glyph", state="normal" if on else "hidden")
 
     def _draw_badge(self, cv, x, cy, text, small=False):
         bw = self.s((10 if small else 12) + (6 if small else 7) * len(text))
@@ -2116,7 +2239,36 @@ class QuotaCard:
     def _on_motion(self, e):
         if self._resize or self._drag:
             return
+        b = self._lights_box
+        self._set_lights_hover(bool(b) and b[0] <= e.x <= b[2] and b[1] <= e.y <= b[3])
         self._set_cursor(self._region(e.x, e.y))
+
+    def _on_leave(self, _e=None):
+        self._set_lights_hover(False)
+        self._set_cursor("")
+
+    def _on_configure(self, e):
+        """窗口被外部改了尺寸(系统 / 窗口管理器)时,内容跟着缩放,而不是被裁掉或留白。"""
+        if e.widget is not self.root or not self._cfg_ready or self._resize or self._cur_w <= 0:
+            return
+        if abs(e.width - self._cur_w) <= 2 and abs(e.height - self._cur_h) <= 2:
+            return  # 我们自己设的尺寸
+        if self._cfg_after is not None:
+            try:
+                self.root.after_cancel(self._cfg_after)
+            except Exception:
+                pass
+        self._cfg_after = self.root.after(120, self._follow_external_size, e.width, e.height)
+
+    def _follow_external_size(self, w: int, h: int):
+        self._cfg_after = None
+        if (w, h) == self._last_forced:
+            return  # 同一个外部尺寸处理过仍被强制(如平铺式窗口管理器):接受现状,不来回拉扯
+        self._last_forced = (w, h)
+        if abs(w - self._cur_w) > 2:
+            self.set_zoom(self.zoom * w / self._cur_w)  # 卡片宽高比固定:按新宽度换算缩放
+        else:
+            self.root.geometry(f"{self._cur_w}x{self._cur_h}")  # 只改了高度:恢复到内容的自然高度
 
     def _do_resize(self, e):
         rs = self._resize
@@ -2370,10 +2522,10 @@ class QuotaCard:
             self.root.attributes("-topmost", self.pinned)
             self.root.lift()
             self._hidden_card = False
-            if IS_MAC:
-                self._mac_apply_window_flags()
             self.render(force=True)
             self._restart_tick()
+            if IS_MAC:
+                self.root.after(200, self._mac_after_map)
         else:
             self.root.withdraw()
             self._hidden_card = True

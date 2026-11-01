@@ -160,7 +160,8 @@ Report back in my language when done.
 
 - **Drag** the card to move it (position is remembered).
 - **Mouse-wheel** to zoom · **drag window edges/corners** to resize · **Ctrl + wheel** (macOS: also **⌘ + scroll**) to fine-tune opacity.
-- **Top bar:** `▲` keep-on-top · `☰` menu · `↻` refresh · `✕` quit.
+- **Top bar:** `▲` keep-on-top · `☰` menu · `↻` refresh · `✕` quit. **macOS:** window controls sit at the top-left as traffic lights, like any Mac window — red quits, yellow hides the card to the menu bar (× / − appear on hover); there is no `✕` on the right.
+- The card always scales as a whole — if the window is resized from outside (OS, tiling window manager), the content follows instead of being clipped.
 - **Menu** (right-click or `☰`; macOS: also two-finger tap / Control-click): Refresh · **Data sources** (tick Claude / Codex — multi-select) · **Card items** (show or hide each window) · **Tray item** (which window's % the tray shows) · Zoom · Opacity · Reset display · Keep on top · **Start at login** · Hide to tray · Quit.
 - **Tray icon:** shows the selected window's percentage (digits only, for size); left-click toggles the card; right-click for the menu; Linux native tray: middle-click refreshes. **macOS:** the % is shown as colored text in the menu bar — click it for Show/Hide card · Refresh · Move card back on screen · Quit.
 - Lost the card after unplugging a monitor? It's moved back on screen automatically at startup, or use **Move card back on screen** in the tray / menu-bar menu.
