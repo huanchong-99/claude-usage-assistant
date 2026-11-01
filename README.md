@@ -28,7 +28,7 @@ English | [简体中文](README.zh-CN.md)
 - **No terminal login, tokens don't go stale** — prefers the **Claude desktop app's** continuously-refreshed token; when using the CLI credential it **auto-refreshes via refreshToken and writes it back**. Codex works the same way (reads `~/.codex/auth.json` and auto-refreshes). All local, read-only against your existing login.
 - **Live 5-hour & 7-day (weekly) usage** (and any other windows your account exposes), color-coded green / amber / red.
 - **Real reset time, your timezone** — shown as a local clock like `今天 04:19` / `06-17 21:59`, derived from your system timezone (UTC+8, UTC+7, …) automatically. A live system clock sits in the footer.
-- **System-tray icon** showing a chosen window's percentage with a `%` sign (default: Claude 5-hour). Left-click toggles the card; hover for a full breakdown.
+- **System-tray icon** showing a chosen window's percentage as large color-coded digits on a white badge, readable on dark and light taskbars (default: Claude 5-hour). Left-click toggles the card; hover for a full breakdown. On Linux desktops with StatusNotifierItem (KDE etc.) a native tray is used, so left-click toggles the card there too.
 - **Frameless, draggable, always-on-top card.** Resize by mouse-wheel, by dragging the window edges/corners, or via the menu.
 - **Menu** (right-click or the `☰` button): **pick data sources** (Claude / Codex), **show or hide each window individually**, pick **which one the tray reflects**, plus zoom, opacity, and reset-display mode (clock vs. countdown).
 - Remembers position, size, opacity, sources, and preferences. **Single-instance guard.** Optional **autostart**.
@@ -36,7 +36,7 @@ English | [简体中文](README.zh-CN.md)
 - **Native on macOS** — the live % sits in the **menu bar** as crisp colored text (not a blurry 22-px bitmap), the Dock icon is hidden like a real menu-bar utility, the pinned card **follows you across Spaces and over full-screen apps**, right-click works with two-finger tap / Control-click, and `⌘Q` / logout quit cleanly.
 - **Lightweight** — only the parts that change are redrawn each second (~10× less CPU than before), background updates wake the UI through an event pipe instead of polling, credentials and the desktop-token decryption are cached, and Claude + Codex are fetched in parallel.
 - **One-click autostart** — tick **Start at login** in the menu (Windows Run key / macOS LaunchAgent / Linux autostart entry).
-- Pure standard-library **tkinter** UI — no heavy UI framework. A single file, fully auditable.
+- Pure standard-library **tkinter** UI — no heavy UI framework. One main file (plus `tray_sni.py`, the optional Linux native tray), fully auditable.
 
 ## Where the token comes from · why it stops expiring
 
@@ -54,7 +54,7 @@ The card only uses the login state **already on your machine**, picking whicheve
 - Decrypting the desktop token is **entirely local** and reads only what your current Windows/macOS user is already entitled to decrypt (the same protection the OS gives the desktop app); it never touches, rewrites, or uploads it.
 - **macOS:** the first time the card reads the desktop token, macOS asks whether `security` may access **"Claude Safe Storage"** — choose **Always Allow** to not be asked again (choose Deny and the card simply sticks to the CLI credential).
 - It only **displays** official usage; it does **not** bypass, modify, or work around any limit.
-- All of it lives in [`quota_card.py`](quota_card.py) — read every line.
+- All of it lives in [`quota_card.py`](quota_card.py) (+ [`tray_sni.py`](tray_sni.py) for the Linux native tray) — read every line.
 
 ## Disclaimer
 
@@ -67,14 +67,14 @@ This tool reads usage from `https://api.anthropic.com/api/oauth/usage` (Claude) 
 | Live usage & data | ✅ | ✅ (file or Keychain) | ✅ |
 | Desktop-token reuse, zero extra deps | ✅ DPAPI + BCrypt | ✅ CommonCrypto | ▢ needs `cryptography` |
 | Transparent rounded card | ✅ color-key | ✅ `-transparent` + `systemTransparent` | ▢ opaque card (square corners) |
-| System tray | ✅ % icon | ✅ menu-bar % text, no Dock icon | ✅ with a tray host |
+| System tray | ✅ % icon | ✅ menu-bar % text, no Dock icon | ✅ native SNI (left-click toggles) · pystray fallback |
 | Card on all desktops / over full-screen apps | — | ✅ when pinned | — |
 | Right-click menu | ✅ | ✅ right-click / two-finger tap / Control-click | ✅ |
 | Start at login (menu toggle) | ✅ Run key | ✅ LaunchAgent | ✅ `~/.config/autostart` |
 | High-DPI / Retina scaling | ✅ | ✅ | ✅ |
 | Single-instance guard | ✅ mutex | ✅ file lock | ✅ file lock |
 
-One file, no per-OS build step. On Linux the card falls back to an opaque (square-cornered) look because X11 has no color-key transparency — everything else works the same. Set `QUOTA_CARD_OPAQUE=1` to force that opaque look on any OS.
+No per-OS build step. On Linux the card falls back to an opaque (square-cornered) look because X11 has no color-key transparency — everything else works the same. Set `QUOTA_CARD_OPAQUE=1` to force that opaque look on any OS.
 
 ## Requirements
 
@@ -85,7 +85,7 @@ One file, no per-OS build step. On Linux the card falls back to an opaque (squar
 - **Claude:** signed in to Claude at least once — **the desktop app alone is enough**, or a terminal `claude` login (token in `~/.claude/.credentials.json` / macOS Keychain).
 - **Codex (optional):** signed in to OpenAI Codex (`codex` login → `~/.codex/auth.json`). No Codex? Just leave only Claude ticked in the menu.
 - **Desktop-token decryption (optional enhancement):** works out of the box on Windows and macOS (system crypto, no extra dependency); on Linux, `pip install cryptography` enables reading the desktop token, otherwise it falls back to the CLI credential.
-- **Linux:** a compositing window manager (the default on GNOME/KDE) for the translucency; the tray needs a system-tray / AppIndicator host.
+- **Linux:** a compositing window manager (the default on GNOME/KDE) for the translucency; the tray needs a system-tray / StatusNotifierItem host. *Optional:* PyGObject (`sudo apt install python3-gi` / `sudo dnf install python3-gobject`) enables the native tray — left-click toggles the card, middle-click refreshes.
 
 ## Install & run
 
@@ -147,7 +147,7 @@ Report back in my language when done.
 - **Mouse-wheel** to zoom · **drag window edges/corners** to resize · **Ctrl + wheel** (macOS: also **⌘ + scroll**) to fine-tune opacity.
 - **Top bar:** `▲` keep-on-top · `☰` menu · `↻` refresh · `✕` quit.
 - **Menu** (right-click or `☰`; macOS: also two-finger tap / Control-click): Refresh · **Data sources** (tick Claude / Codex — multi-select) · **Card items** (show or hide each window) · **Tray item** (which window's % the tray shows) · Zoom · Opacity · Reset display · Keep on top · **Start at login** · Hide to tray · Quit.
-- **Tray icon:** shows the selected window's `%`; left-click toggles the card; right-click for the menu. **macOS:** the % is shown as colored text in the menu bar — click it for Show/Hide card · Refresh · Move card back on screen · Quit.
+- **Tray icon:** shows the selected window's percentage (digits only, for size); left-click toggles the card; right-click for the menu; Linux native tray: middle-click refreshes. **macOS:** the % is shown as colored text in the menu bar — click it for Show/Hide card · Refresh · Move card back on screen · Quit.
 - Lost the card after unplugging a monitor? It's moved back on screen automatically at startup, or use **Move card back on screen** in the tray / menu-bar menu.
 
 Bar colors: green `< 50%`, amber `50–80%`, red `≥ 80%`.
@@ -193,6 +193,8 @@ If you move the folder or switch Python, toggle it off and on again so the store
 ## Credits
 
 - Data approach referenced from [jens-duttke/usage-monitor-for-claude](https://github.com/jens-duttke/usage-monitor-for-claude).
+- Linux native StatusNotifierItem tray (`tray_sni.py`) contributed by [@zj243](https://github.com/zj243) in [#1](https://github.com/huanchong-99/claude-usage-assistant/pull/1).
+- Microsoft Store build support and the tray-icon readability redesign were reported by [@B-22](https://github.com/B-22) in [#2](https://github.com/huanchong-99/claude-usage-assistant/issues/2) and [#3](https://github.com/huanchong-99/claude-usage-assistant/issues/3).
 - The official `rate_limits` field is documented in the [Claude Code status line docs](https://code.claude.com/docs/en/statusline).
 
 ## License

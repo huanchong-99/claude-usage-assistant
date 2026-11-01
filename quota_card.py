@@ -24,7 +24,7 @@ Claude / Codex 实时限额卡片  (quota_card.py)
   · 顶部按钮:▲=置顶  ≡=菜单  ↻=刷新  ✕=退出
   · 右键空白处 或 点 ≡ = 打开菜单(macOS:双指轻点 / Control+单击 亦可)
   · 托盘图标:默认显示 Claude 5 小时用量(可在菜单切换);左键单击=显示/隐藏卡片
-    (macOS:菜单栏直接显示彩色百分比,点击弹出菜单)
+    (Linux 原生托盘:中键=立即刷新;macOS:菜单栏直接显示彩色百分比,点击弹出菜单)
 
 命令行:
   --check            不开界面,只拉一次数据并打印诊断信息
@@ -1201,6 +1201,8 @@ _TRAY_FONT_FILES = (
     "/System/Library/Fonts/SFNS.ttf", "/System/Library/Fonts/Helvetica.ttc",
     # Linux
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/liberation-sans-fonts/LiberationSans-Bold.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
     "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf", "/usr/share/fonts/noto/NotoSans-Bold.ttf",
@@ -1212,6 +1214,17 @@ def _tray_font_path() -> str | None:
     for fp in _TRAY_FONT_FILES:
         if os.path.isfile(fp):
             return fp
+    # 仅给文件名:交给 Pillow 在系统字体目录里搜索(只搜一次,结果缓存)
+    try:
+        from PIL import ImageFont
+    except Exception:
+        return None
+    for name in ("DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "Arial Bold.ttf", "arialbd.ttf"):
+        try:
+            ImageFont.truetype(name, 12)
+            return name
+        except Exception:
+            continue
     return None
 
 
@@ -1476,9 +1489,9 @@ class QuotaCard:
             return False
 
     # ---- 后台轮询 ----
-    def _post(self, cmd: str):
+    def _post(self, cmd: str, payload=None):
         """任何线程都可调用:把命令交给 Tk 主线程执行。"""
-        self.cmd_q.put(cmd)
+        self.cmd_q.put((cmd, payload))
         self._wake.notify()
 
     def _worker(self):
@@ -1531,9 +1544,12 @@ class QuotaCard:
     def _drain_cmds(self):
         try:
             while True:
-                cmd = self.cmd_q.get_nowait()
-                {"data": self._on_data, "toggle_card": self.toggle_card, "refresh": self.refresh_now,
-                 "reset_pos": self.reset_position, "quit": self.quit}.get(cmd, lambda: None)()
+                cmd, payload = self.cmd_q.get_nowait()
+                if cmd == "menu_at":  # 托盘右键(Linux 原生 SNI 的 ContextMenu):在桌面给出的屏幕坐标弹菜单
+                    self.open_menu(payload)
+                else:
+                    {"data": self._on_data, "toggle_card": self.toggle_card, "refresh": self.refresh_now,
+                     "reset_pos": self.reset_position, "quit": self.quit}.get(cmd, lambda: None)()
                 if self._stop:
                     return
         except queue.Empty:
@@ -1768,11 +1784,42 @@ class QuotaCard:
                               fill=col, outline="")
 
     # ---- 托盘 ----
-    def _setup_tray(self):
+    def _setup_sni_tray(self) -> bool:
+        """Linux:优先用原生 StatusNotifierItem(tray_sni.py,来自 @zj243 的 PR #1)。
+           桌面左键调用 Activate、右键调用 ContextMenu、中键调用 SecondaryActivate,由应用直接接管:
+           左键=显示/隐藏卡片、右键=菜单、中键=立即刷新,与 Windows 一致——pystray 的 AppIndicator
+           后端左键只能弹菜单,GtkStatusIcon 在 KDE/Wayland 下点击转发又不可靠。
+           没装 PyGObject 或桌面没有 SNI 宿主时返回 False,回退 pystray。"""
         try:
-            import pystray
+            from tray_sni import SNITray
+            tray = SNITray("ai_usage_card", self._tray_image(None), "AI 用量",
+                           on_activate=lambda x, y: self._post("toggle_card"),
+                           on_context=lambda x, y: self._post("menu_at", (x, y)),
+                           on_secondary=lambda x, y: self._post("refresh"))
+            threading.Thread(target=tray.run, daemon=True, name="tray-sni").start()
+            tray.wait_ready()
+        except Exception:
+            return False
+        self.tray = tray
+        return True
+
+    def _setup_tray(self):
+        if IS_LINUX and self._setup_sni_tray():
+            return
+        try:
             import PIL
             _ = PIL.__version__
+            try:
+                import pystray
+            except ImportError:
+                raise
+            except Exception:
+                # pystray 在"装了 PyGObject 但没有 GTK3"时选后端会抛 ValueError 而不是继续尝试 xorg;
+                # 这里显式指定 xorg 后端再试一次
+                if not IS_LINUX or os.environ.get("PYSTRAY_BACKEND"):
+                    raise
+                os.environ["PYSTRAY_BACKEND"] = "xorg"
+                import pystray
         except Exception:  # 未安装,或 Linux 上没有可用的托盘后端 / 显示
             self.tray = None
             return
@@ -2004,9 +2051,10 @@ class QuotaCard:
             self.set_zoom(self.zoom * (WHEEL_ZOOM_STEP ** steps))
 
     # ---- 菜单 ----
-    def open_menu(self):
+    def open_menu(self, at=None):
+        """at=(x, y) 时在该屏幕坐标弹出(托盘右键);否则跟随鼠标当前位置(卡片内点击)。"""
         self._build_menu()
-        x, y = self.root.winfo_pointerxy()
+        x, y = (int(at[0]), int(at[1])) if at else self.root.winfo_pointerxy()
         try:
             self.menu.tk_popup(x, y)
         finally:
@@ -2286,6 +2334,13 @@ def _env_report() -> list[str]:
     except Exception as e:  # 已安装但没有可用的托盘后端 / 图形显示
         tray = f"不可用({type(e).__name__})"
     lines.append(f"托盘: {tray}")
+    if IS_LINUX:
+        try:
+            import gi  # noqa: F401
+            sni = "可用(PyGObject 已安装;桌面需支持 StatusNotifierItem,如 KDE)"
+        except Exception:
+            sni = "不可用(装 python3-gi / python3-gobject 后左键可直接切换卡片)"
+        lines.append(f"Linux 原生托盘: {sni}")
     if IS_MAC:
         lines.append(f"菜单栏文字 / 隐藏 Dock / 所有桌面: {'可用' if _appkit() else '不可用(需 PyObjC,随 pystray 安装)'}")
     if IS_WIN:

@@ -4,3 +4,4 @@ pystray>=0.19
 Pillow>=9.0
 # Linux 读取 Claude 桌面版令牌需要(可选);Windows / macOS 用系统自带加解密,无需安装。
 # cryptography>=41
+# Linux 原生托盘(左键切换卡片)需要 PyGObject(可选);建议用发行版的包:python3-gi / python3-gobject

@@ -99,6 +99,8 @@ class SNITray:
         self._reg_id = 0
         self._ready = threading.Event()
         self._error = None
+        self._abandoned = False      # wait_ready 超时后调用方已回退 pystray:迟到的注册要撤销
+        self._watcher_owner = None   # 当前 StatusNotifierWatcher 的唯一名,用于识别宿主重启
 
     # ---- 图标转换:PIL.RGBA -> SNI 要求的 ARGB32(网络字节序、每像素 A,R,G,B)----
     @staticmethod
@@ -120,23 +122,47 @@ class SNITray:
                 _ITEM_PATH, node.interfaces[0],
                 self._on_method_call, self._on_get_property, None)
             # 向桌面的 StatusNotifierWatcher 注册自己(以本连接的唯一名作为服务标识)
-            self._conn.call_sync(
-                _WATCHER_NAME, _WATCHER_PATH, _WATCHER_NAME,
-                "RegisterStatusNotifierItem",
-                GLib.Variant("(s)", (self._conn.get_unique_name(),)),
-                None, Gio.DBusCallFlags.NONE, 3000, None)
+            self._register()
         except Exception as e:
             # 没有 SNI 宿主(如非 KDE 且无 AppIndicator 扩展)时在此失败,交由上层回退
             self._error = e
             self._ready.set()
             return
+        if self._abandoned:  # 注册得太晚,调用方已回退到 pystray:撤销,避免出现两个托盘图标
+            self._conn.unregister_object(self._reg_id)
+            return
         self._ready.set()
+        # 托盘宿主(如 plasmashell)重启后 Watcher 会以新的唯一名重新出现,
+        # 此时必须重新注册,否则托盘图标会一直消失
+        Gio.bus_watch_name_on_connection(
+            self._conn, _WATCHER_NAME, Gio.BusNameWatcherFlags.NONE,
+            self._on_watcher_appeared, None)
         self._loop = GLib.MainLoop()
         self._loop.run()
 
+    def _register(self):
+        self._conn.call_sync(
+            _WATCHER_NAME, _WATCHER_PATH, _WATCHER_NAME,
+            "RegisterStatusNotifierItem",
+            GLib.Variant("(s)", (self._conn.get_unique_name(),)),
+            None, Gio.DBusCallFlags.NONE, 3000, None)
+
+    def _on_watcher_appeared(self, _conn, _name, owner):
+        if self._watcher_owner is None:  # 首次回调:注册时宿主本来就在,无需重复注册
+            self._watcher_owner = owner
+            return
+        if owner != self._watcher_owner:
+            self._watcher_owner = owner
+            try:
+                self._register()
+            except Exception:
+                pass
+
     def wait_ready(self, timeout=4.0):
-        """等待注册完成;注册失败则抛出原始异常,供上层 try/except 回退到 pystray。"""
-        self._ready.wait(timeout)
+        """等待注册完成;注册失败或超时则抛出异常,供上层 try/except 回退到 pystray。"""
+        if not self._ready.wait(timeout):
+            self._abandoned = True
+            raise TimeoutError("StatusNotifierWatcher 无响应")
         if self._error is not None:
             raise self._error
 

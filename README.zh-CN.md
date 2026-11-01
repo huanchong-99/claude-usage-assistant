@@ -28,7 +28,7 @@
 - **免终端登录、令牌不再过期** —— 优先复用 **Claude 桌面版**持续自动续期的登录令牌;CLI 凭证临期时也会**自动用 refreshToken 续期并写回**。Codex 同理(读 `~/.codex/auth.json` 并自动续期)。全过程本地完成,只读你已有的登录态。
 - **实时 5 小时 / 7 天(每周)用量**(及账号存在的其它窗口),按用量绿 / 黄 / 红变色。
 - **按系统时区显示真实重置时刻**——形如 `今天 04:19` / `06-17 21:59`,根据系统时区(东八区、东七区……)自动换算;底部还有一个实时系统时钟。
-- **系统托盘图标**:显示所选窗口的百分比并带 `%`(默认 Claude 5 小时);左键单击显示/隐藏卡片,悬停查看全部明细。
+- **系统托盘图标**:白色圆角底 + 按用量变色的大号数字,深色 / 浅色任务栏上都清晰(默认 Claude 5 小时);左键单击显示/隐藏卡片,悬停查看全部明细。支持 StatusNotifierItem 的 Linux 桌面(如 KDE)使用原生托盘,左键同样可以切换卡片。
 - **无边框、可拖动、置顶**;支持**滚轮缩放 / 拖动窗口边缘缩放 / 菜单选档位**。
 - **菜单**(右键或 `☰` 按钮):**选择数据源**(Claude / Codex),**逐个开关卡片上的每个窗口**,选择**托盘显示哪一个**,以及缩放、不透明度、重置显示方式(时刻 / 倒计时)。
 - 记忆位置、大小、不透明度、数据源与偏好;**单实例保护**;可选**开机自启**。
@@ -36,7 +36,7 @@
 - **macOS 原生体验** —— 百分比以**彩色文字显示在菜单栏**(清晰锐利,不再是被缩成 22px 的模糊位图);像原生菜单栏小工具一样**隐藏 Dock 图标**;置顶时卡片**跟随你切换所有桌面(Spaces)、可浮在全屏 App 之上**;右键 / 双指轻点 / Control+单击 都能开菜单;`⌘Q`、注销、关机都会正常保存退出。
 - **轻量省电** —— 每秒只重绘变化的几处文字(CPU 占用约为原来的 1/10);后台数据通过事件管道唤醒界面而非定时轮询;凭证与桌面版令牌解密结果都有缓存;Claude 与 Codex 并发拉取。
 - **一键开机自启** —— 菜单里勾选 **开机自启** 即可(Windows 注册表 Run / macOS LaunchAgent / Linux autostart)。
-- 界面使用 Python 自带 **tkinter**,无重型 UI 框架;单文件,可逐行审计。
+- 界面使用 Python 自带 **tkinter**,无重型 UI 框架;一个主文件(外加可选的 Linux 原生托盘 `tray_sni.py`),可逐行审计。
 
 ## 令牌从哪来 · 为什么不再过期
 
@@ -54,7 +54,7 @@
 - 解密桌面版令牌**全程本地**、只读你当前 Windows/macOS 用户能解的内容(与系统给桌面版的保护同源);不触碰、不改写、不上传。
 - **macOS:** 卡片第一次读取桌面版令牌时,系统会询问是否允许 `security` 访问钥匙串中的 **"Claude Safe Storage"**——选 **始终允许** 以后就不再询问(选拒绝则卡片只使用 CLI 凭证)。
 - 它只**显示**官方用量,**不绕过、不修改、不规避**任何限额。
-- 全部逻辑都在 [`quota_card.py`](quota_card.py),可逐行审计。
+- 全部逻辑都在 [`quota_card.py`](quota_card.py)(Linux 原生托盘另见 [`tray_sni.py`](tray_sni.py)),可逐行审计。
 
 ## 免责声明
 
@@ -67,14 +67,14 @@
 | 实时用量与数据 | ✅ | ✅(凭证文件或钥匙串) | ✅ |
 | 复用桌面版令牌(零额外依赖) | ✅ DPAPI + BCrypt | ✅ CommonCrypto | ▢ 需 `cryptography` |
 | 透明圆角卡片 | ✅ 色键 | ✅ `-transparent` + `systemTransparent` | ▢ 不透明卡片(方角) |
-| 系统托盘 | ✅ 百分比图标 | ✅ 菜单栏彩色百分比、隐藏 Dock 图标 | ✅ 需托盘宿主 |
+| 系统托盘 | ✅ 百分比图标 | ✅ 菜单栏彩色百分比、隐藏 Dock 图标 | ✅ 原生 SNI(左键切换卡片)· pystray 兜底 |
 | 卡片在所有桌面 / 全屏 App 上可见 | — | ✅ 置顶时 | — |
 | 右键菜单 | ✅ | ✅ 右键 / 双指轻点 / Control+单击 | ✅ |
 | 开机自启(菜单一键开关) | ✅ 注册表 Run | ✅ LaunchAgent | ✅ `~/.config/autostart` |
 | 高分屏 / Retina 缩放 | ✅ | ✅ | ✅ |
 | 单实例保护 | ✅ 互斥量 | ✅ 文件锁 | ✅ 文件锁 |
 
-单文件、无需按系统打包。Linux 上因 X11 没有色键透明,卡片退化为不透明(方角)外观,其余功能完全一致。设环境变量 `QUOTA_CARD_OPAQUE=1` 可在任意系统强制该不透明外观。
+无需按系统打包。Linux 上因 X11 没有色键透明,卡片退化为不透明(方角)外观,其余功能完全一致。设环境变量 `QUOTA_CARD_OPAQUE=1` 可在任意系统强制该不透明外观。
 
 ## 环境要求
 
@@ -85,7 +85,7 @@
 - **Claude:** 已登录过 Claude(桌面版,或终端 `claude` 登录 → 凭证在 `~/.claude/.credentials.json` / macOS 钥匙串)。**只用桌面版即可**,无需终端登录。
 - **Codex(可选):** 已登录过 OpenAI Codex(`codex` 登录 → 凭证在 `~/.codex/auth.json`)。没装 Codex 就在菜单里只留 Claude。
 - **桌面版令牌解密(可选增强):** Windows 与 macOS 开箱即用(系统自带加解密,无额外依赖);Linux 若要读桌面版令牌,装 `cryptography` 即可(`pip install cryptography`),否则回退到 CLI 凭证路径。
-- **Linux:** 需要合成型窗口管理器(GNOME/KDE 默认即是)以实现半透明;托盘需要系统托盘 / AppIndicator 宿主。
+- **Linux:** 需要合成型窗口管理器(GNOME/KDE 默认即是)以实现半透明;托盘需要系统托盘 / StatusNotifierItem 宿主。*可选:* 装 PyGObject(`sudo apt install python3-gi` / `sudo dnf install python3-gobject`)启用原生托盘——左键切换卡片、中键立即刷新。
 
 ## 安装与运行
 
@@ -147,7 +147,7 @@ python quota_card.py --check     # macOS/Linux:python3 quota_card.py --check
 - **滚轮**缩放 · **拖动窗口边缘/四角**缩放 · **Ctrl + 滚轮**(macOS 也可 **⌘ + 滚动**)微调不透明度。
 - **顶栏:** `▲` 置顶 · `☰` 菜单 · `↻` 刷新 · `✕` 退出。
 - **菜单**(右键或 `☰`;macOS 也可双指轻点 / Control+单击):立即刷新 · **数据源**(勾选 Claude / Codex,可多选) · **卡片显示**(逐个显示或隐藏每个窗口) · **托盘显示**(托盘呈现哪个窗口的 %) · 缩放 · 不透明度 · 重置显示 · 窗口置顶 · **开机自启** · 隐藏到托盘 · 退出。
-- **托盘图标:** 显示所选窗口的 `%`;左键单击显示/隐藏卡片;右键打开菜单。**macOS:** 百分比以彩色文字显示在菜单栏,点击弹出菜单:显示/隐藏卡片 · 立即刷新 · 卡片移回屏幕 · 退出。
+- **托盘图标:** 显示所选窗口的百分比(只显示数字,以便放大);左键单击显示/隐藏卡片;右键打开菜单;Linux 原生托盘中键 = 立即刷新。**macOS:** 百分比以彩色文字显示在菜单栏,点击弹出菜单:显示/隐藏卡片 · 立即刷新 · 卡片移回屏幕 · 退出。
 - 拔掉外接显示器后卡片"不见了"?启动时会自动移回屏幕内;也可在托盘 / 菜单栏菜单里点 **卡片移回屏幕**。
 
 颜色:绿 `< 50%`,黄 `50–80%`,红 `≥ 80%`。
@@ -193,6 +193,8 @@ python3 quota_card.py --autostart on     # 关闭用 off
 ## 致谢
 
 - 数据获取思路参考自 [jens-duttke/usage-monitor-for-claude](https://github.com/jens-duttke/usage-monitor-for-claude)。
+- Linux 原生 StatusNotifierItem 托盘(`tray_sni.py`)由 [@zj243](https://github.com/zj243) 在 [#1](https://github.com/huanchong-99/claude-usage-assistant/pull/1) 贡献。
+- 微软商店版支持与托盘图标可读性改进由 [@B-22](https://github.com/B-22) 在 [#2](https://github.com/huanchong-99/claude-usage-assistant/issues/2)、[#3](https://github.com/huanchong-99/claude-usage-assistant/issues/3) 提出。
 - 官方 `rate_limits` 字段见 [Claude Code 状态行文档](https://code.claude.com/docs/en/statusline)。
 
 ## 许可证
