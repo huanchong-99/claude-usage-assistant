@@ -3,12 +3,12 @@
 Claude / Codex 实时限额卡片  (quota_card.py)
 ============================================
 常驻桌面、置顶、卡片式小部件,实时显示 AI 编码助手的额度使用情况,
-并按"系统本地时区"显示每个窗口的实际重置时刻。附带系统托盘图标。
+并按"系统本地时区"显示每个窗口的实际重置时刻。附带系统托盘图标(macOS 为菜单栏)。
 支持两个数据源,可在菜单"数据源"里同时显示或只选其一:
 
   · Claude —— GET https://api.anthropic.com/api/oauth/usage(与 Claude Code 同源)
       额度在服务端按账号统计:CLI / 桌面版 / 网页的用量都计入同一份额度。
-      凭证:~/.claude/.credentials.json(macOS 亦支持登录钥匙串)。
+      凭证:~/.claude/.credentials.json(macOS 亦支持登录钥匙串)或 Claude 桌面版的登录缓存。
       accessToken 过期时自动用 refreshToken 续期并写回,不再依赖终端登录刷新。
   · Codex —— GET https://chatgpt.com/backend-api/wham/usage(与 Codex CLI 同源)
       凭证:~/.codex/auth.json(ChatGPT 登录模式);同样自动续期并写回。
@@ -19,13 +19,20 @@ Claude / Codex 实时限额卡片  (quota_card.py)
 
 操作:
   · 拖动卡片移动(记忆位置)
-  · 滚轮缩放 / 拖动窗口边缘缩放 / 右键菜单选档位     · Ctrl+滚轮 微调不透明度
-  · 顶部按钮:图钉=置顶  ≡=菜单  ↻=刷新  ✕=退出
-  · 右键空白处 或 点 ≡ = 打开菜单(数据源 / 卡片显示 / 托盘显示 / 缩放 / 不透明度 / 重置显示 …)
+  · 滚轮缩放 / 拖动窗口边缘缩放 / 右键菜单选档位
+  · Ctrl+滚轮 微调不透明度(macOS 上 ⌘+滚轮 亦可)
+  · 顶部按钮:▲=置顶  ≡=菜单  ↻=刷新  ✕=退出
+  · 右键空白处 或 点 ≡ = 打开菜单(macOS:双指轻点 / Control+单击 亦可)
   · 托盘图标:默认显示 Claude 5 小时用量(可在菜单切换);左键单击=显示/隐藏卡片
+    (macOS:菜单栏直接显示彩色百分比,点击弹出菜单)
+
+命令行:
+  --check            不开界面,只拉一次数据并打印诊断信息
+  --autostart on|off 开启 / 关闭开机自启(Windows 注册表 Run / macOS LaunchAgent / Linux autostart)
 """
 from __future__ import annotations
 
+import functools
 import json
 import math
 import os
@@ -86,7 +93,9 @@ def _resolve_font(root) -> None:
 
 # ---------------- 配置 ----------------
 REFRESH_INTERVAL = 60
+ERROR_RETRY_INTERVAL = 15    # 网络失败(如刚从睡眠唤醒、Wi-Fi 未连上)后的快速重试间隔(秒)
 REFRESH_RETRY_COOLDOWN = 60  # token 续期失败后的最小重试间隔(秒)
+KEYCHAIN_CACHE_TTL = 300     # mac 钥匙串凭证在内存里的缓存时长(秒),避免每分钟起一次 security 子进程
 
 # Claude(与 Claude Code CLI 同源的官方接口与 OAuth 客户端)
 API_URL_USAGE = "https://api.anthropic.com/api/oauth/usage"
@@ -108,9 +117,20 @@ CODEX_UA = "codex-cli"
 
 STATE_FILE = Path(__file__).with_name("card_state.json")
 
+# 开机自启的标识(Windows 注册表值名 / macOS LaunchAgent Label / Linux .desktop 文件名)
+AUTOSTART_NAME = "AIUsageCard"
+LAUNCH_AGENT_LABEL = "io.github.huanchong-99.ai-usage-card"
+_WIN_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
 MIN_ZOOM, MAX_ZOOM = 0.6, 2.2
 EDGE = 7  # 边缘缩放感应区(基准像素)
 DEFAULT_TRAY_KEY = "five_hour"
+
+# 滚轮:Windows 按 delta 累计到 120 走一档(兼容高精度滚轮/触控板);
+# mac/Linux 的 Tk 事件不带统一刻度(mac 触控板一次滑动会连发几十个事件),按时间节流。
+WHEEL_ZOOM_STEP = 1.05 if IS_MAC else 1.08
+WHEEL_MIN_GAP = 0.06 if IS_MAC else 0.03
+WHEEL_ALPHA_MODS = 0x0004 | (0x0008 if IS_MAC else 0)  # Control;mac 上 ⌘(Tk 的 Mod1)也行
 
 BW, BPAD, BROW, BHEADER, BFOOTER, BRAD = 300, 15, 52, 34, 32, 15
 BSEC, BMSG = 26, 36  # 分节标题高度 / 单行提示高度(基准像素)
@@ -146,6 +166,8 @@ ORDER = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet",
          "seven_day_cowork", "seven_day_oauth_apps"]
 WEEK = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
+NET_ERR = "网络连接失败,重试中…"
+
 
 # ================= 通用工具 =================
 def _atomic_write_json(path: Path, obj) -> None:
@@ -171,7 +193,90 @@ def _jwt_exp(tok: str) -> float | None:
         return None
 
 
+_sessions: dict = {}
+_sessions_lock = threading.Lock()
+
+
+def _http(name: str) -> requests.Session:
+    """每个数据源一个长连接 Session:复用 TCP/TLS 连接,省去每次刷新的握手。
+       仅对幂等的 GET 做一次自动重试(复用连接恰好被服务端关闭时);续期用的 POST 绝不重试,
+       以免 refreshToken 轮换后被重复提交。"""
+    with _sessions_lock:
+        s = _sessions.get(name)
+        if s is None:
+            s = requests.Session()
+            try:
+                from requests.adapters import HTTPAdapter
+                from urllib3.util.retry import Retry
+                retry = Retry(total=2, connect=2, read=1, status=0, backoff_factor=0.5,
+                              allowed_methods=frozenset({"GET"}), raise_on_status=False)
+                s.mount("https://", HTTPAdapter(max_retries=retry))
+            except Exception:
+                pass  # urllib3 过旧等情况:用默认适配器即可
+            _sessions[name] = s
+        return s
+
+
+def _run_parallel(funcs: dict):
+    """并发执行 {key: fn},按完成先后逐个 yield (key, result)。用守护线程,退出时不被卡住。"""
+    q: queue.Queue = queue.Queue()
+
+    def run(k, fn):
+        try:
+            res = fn()
+        except Exception as e:  # 兜底:任何未预期异常都转成错误文案,不让后台线程挂掉
+            res = {"error": f"获取失败:{type(e).__name__}"}
+        q.put((k, res))
+
+    for k, fn in funcs.items():
+        threading.Thread(target=run, args=(k, fn), daemon=True, name=f"fetch-{k}").start()
+    for _ in funcs:
+        yield q.get()
+
+
 _ua_cache: str | None = None
+
+
+def _find_claude_bin() -> str | None:
+    """找 claude 可执行文件。从登录项 / LaunchAgent / 访达双击启动时 PATH 很短
+       (只有 /usr/bin:/bin…),所以额外查一遍常见安装位置。"""
+    import shutil
+    found = shutil.which("claude")
+    if found:
+        return found
+    home = Path.home()
+    for cand in (home / ".local" / "bin" / "claude", home / ".claude" / "local" / "claude",
+                 Path("/opt/homebrew/bin/claude"), Path("/usr/local/bin/claude"),
+                 home / ".npm-global" / "bin" / "claude", home / ".bun" / "bin" / "claude"):
+        try:
+            if cand.is_file() and os.access(cand, os.X_OK):
+                return str(cand)
+        except OSError:
+            continue
+    return None
+
+
+def _claude_version_fast(path: str) -> str | None:
+    """不启动 Node 就拿到版本号:原生安装的符号链接目标就是 …/versions/<版本>;
+       npm 安装则读同目录树里 @anthropic-ai/claude-code 的 package.json。"""
+    import re
+    semver = re.compile(r"\d+\.\d+\.\d+")
+    try:
+        real = Path(os.path.realpath(path))
+    except Exception:
+        return None
+    if semver.fullmatch(real.name):
+        return real.name
+    dirs = list(real.parents)[:4] + [Path(path).parent / "node_modules" / "@anthropic-ai" / "claude-code"]
+    for d in dirs:
+        try:
+            meta = json.loads((d / "package.json").read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        ver = str(meta.get("version") or "")
+        if meta.get("name") == "@anthropic-ai/claude-code" and semver.fullmatch(ver):
+            return ver
+    return None
 
 
 def user_agent() -> str:
@@ -180,11 +285,12 @@ def user_agent() -> str:
         return _ua_cache
     ver = None
     try:
-        import re
-        import shutil
-        import subprocess
-        claude = shutil.which("claude")
+        claude = _find_claude_bin()
         if claude:
+            ver = _claude_version_fast(claude)
+        if claude and not ver:  # 推断不出来才真的跑一次 claude --version(冷启动 Node 较慢)
+            import re
+            import subprocess
             p = subprocess.run([claude, "--version"], capture_output=True, text=True,
                                timeout=8, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             m = re.match(r"(\d+\.\d+\.\d+)", (p.stdout or "").strip())
@@ -194,6 +300,23 @@ def user_agent() -> str:
         pass
     _ua_cache = f"claude-code/{ver}" if ver else FALLBACK_UA
     return _ua_cache
+
+
+_APPKIT = 0  # 0=未尝试;None=不可用;否则为 AppKit 模块
+
+
+def _appkit():
+    """mac:按需导入 PyObjC 的 AppKit(装 pystray 时会随之安装);不可用返回 None。"""
+    global _APPKIT
+    if _APPKIT == 0:
+        _APPKIT = None
+        if IS_MAC:
+            try:
+                import AppKit  # type: ignore[import-not-found]
+                _APPKIT = AppKit
+            except Exception:
+                pass
+    return _APPKIT
 
 
 # ================= Claude Desktop 常驻令牌(免终端登录) =================
@@ -207,7 +330,7 @@ def _desktop_dir() -> Path | None:
         return Path(base) / "Claude" if base else None
     if IS_MAC:
         return Path.home() / "Library" / "Application Support" / "Claude"
-    return Path.home() / ".config" / "Claude"
+    return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "Claude"
 
 
 def _win_dpapi_unprotect(blob: bytes) -> bytes | None:
@@ -295,8 +418,47 @@ def _gcm_decrypt(key: bytes, nonce: bytes, ct_tag: bytes) -> bytes | None:
     return None
 
 
+_cccrypt = 0  # 0=未尝试;None=不可用;否则为 CCCrypt 函数
+
+
+def _mac_cbc_decrypt(key: bytes, iv: bytes, ct: bytes) -> bytes | None:
+    """AES-CBC + PKCS7 via macOS 系统自带 CommonCrypto(纯 ctypes,无三方依赖)。"""
+    global _cccrypt
+    import ctypes
+    if _cccrypt == 0:
+        _cccrypt = None
+        for lib in ("/usr/lib/system/libcommonCrypto.dylib", "/usr/lib/libSystem.B.dylib"):
+            try:
+                fn = ctypes.CDLL(lib).CCCrypt
+            except (OSError, AttributeError):
+                continue
+            # CCCryptorStatus CCCrypt(CCOperation op, CCAlgorithm alg, CCOptions options,
+            #     const void *key, size_t keyLength, const void *iv,
+            #     const void *dataIn, size_t dataInLength,
+            #     void *dataOut, size_t dataOutAvailable, size_t *dataOutMoved);
+            fn.restype = ctypes.c_int32
+            fn.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                           ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p,
+                           ctypes.c_char_p, ctypes.c_size_t,
+                           ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+            _cccrypt = fn
+            break
+    if not _cccrypt:
+        return None
+    k_decrypt, k_aes, k_pkcs7 = 1, 0, 1  # kCCDecrypt / kCCAlgorithmAES / kCCOptionPKCS7Padding
+    out = ctypes.create_string_buffer(len(ct) + 16)
+    moved = ctypes.c_size_t(0)
+    try:
+        st = _cccrypt(k_decrypt, k_aes, k_pkcs7, key, len(key), iv, ct, len(ct),
+                      out, len(out), ctypes.byref(moved))
+    except Exception:
+        return None
+    return out.raw[:moved.value] if st == 0 else None
+
+
 def _cbc_decrypt(key: bytes, iv: bytes, ct: bytes) -> bytes | None:
-    """AES-128-CBC(mac/Linux 的 safeStorage 用),需第三方库;无库则返回 None。"""
+    """AES-128-CBC(mac/Linux 的 safeStorage 用)。
+       依次尝试 cryptography → pycryptodome → macOS 系统 CommonCrypto(零依赖)。"""
     pt = None
     try:
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -306,10 +468,14 @@ def _cbc_decrypt(key: bytes, iv: bytes, ct: bytes) -> bytes | None:
         try:
             from Crypto.Cipher import AES
             pt = AES.new(key, AES.MODE_CBC, iv).decrypt(ct)
+        except ImportError:
+            pt = None
         except Exception:
             return None
     except Exception:
         return None
+    if pt is None:  # 两个三方库都没装
+        return _mac_cbc_decrypt(key, iv, ct) if IS_MAC else None
     if not pt:
         return None
     pad = pt[-1]  # 去 PKCS7 填充
@@ -349,9 +515,10 @@ def _compute_safestorage_key():
     try:
         import hashlib
         if IS_MAC:
+            # 首次读取时 macOS 会弹钥匙串授权框;点"始终允许"后不再询问。拒绝则本进程不再尝试。
             import subprocess
             p = subprocess.run(["security", "find-generic-password", "-w", "-s", "Claude Safe Storage"],
-                               capture_output=True, text=True, timeout=8)
+                               capture_output=True, text=True, timeout=30)
             if p.returncode != 0 or not p.stdout.strip():
                 return None
             pw, iters = p.stdout.strip().encode(), 1003
@@ -380,25 +547,42 @@ def _desktop_decrypt(b64_value: str, keyinfo) -> bytes | None:
     return None
 
 
+_desk_cache: dict = {"stamp": None, "tokens": []}
+
+
 def _claude_desktop_tokens() -> list[dict]:
     """读桌面版 config.json 里的 OAuth 令牌缓存,返回可用于 /api/oauth/usage 的候选:
-       [{'token','expiresAt'(秒),'refreshToken','plan'}],按 api.anthropic.com + user:inference 过滤。只读。"""
+       [{'token','expiresAt'(秒),'refreshToken','plan'}],按 api.anthropic.com + user:inference 过滤。只读。
+       按文件 (mtime, size) 缓存解密结果:文件没变就不重复解析 + 解密。"""
     d = _desktop_dir()
     if not d:
         return []
     cfg_path = d / "config.json"
     try:
+        st = cfg_path.stat()
+    except OSError:
+        return []
+    stamp = (st.st_mtime_ns, st.st_size)
+    if stamp != _desk_cache["stamp"]:
+        _desk_cache["tokens"] = _read_desktop_tokens(cfg_path)
+        _desk_cache["stamp"] = stamp
+    return _desk_cache["tokens"]
+
+
+def _read_desktop_tokens(cfg_path: Path) -> list[dict]:
+    try:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     except Exception:
+        return []
+    encs = [cfg.get(k) for k in ("oauth:tokenCacheV2", "oauth:tokenCache")]
+    encs = [e for e in encs if isinstance(e, str) and e]
+    if not encs:  # 没有令牌缓存就别去取密钥(mac 上取密钥会弹钥匙串授权框)
         return []
     keyinfo = _safestorage_key()
     if not keyinfo:
         return []
     merged: dict = {}
-    for cache_key in ("oauth:tokenCacheV2", "oauth:tokenCache"):
-        enc = cfg.get(cache_key)
-        if not isinstance(enc, str):
-            continue
+    for enc in encs:  # V2 在前,优先
         raw = _desktop_decrypt(enc, keyinfo)
         if not raw:
             continue
@@ -408,7 +592,7 @@ def _claude_desktop_tokens() -> list[dict]:
             continue
         if isinstance(obj, dict):
             for k, v in obj.items():
-                merged.setdefault(k, v)  # V2 优先
+                merged.setdefault(k, v)
     out = []
     for k, v in merged.items():
         if not isinstance(v, dict):
@@ -431,28 +615,31 @@ def _claude_desktop_tokens() -> list[dict]:
 _keychain_service: str | None = None
 
 
+def _keychain_read_service(service: str) -> str | None:
+    import subprocess
+    try:
+        p = subprocess.run(["security", "find-generic-password", "-s", service, "-w"],
+                           capture_output=True, text=True, timeout=8)
+    except Exception:
+        return None
+    out = (p.stdout or "").strip()
+    return out if p.returncode == 0 and out else None
+
+
 def _keychain_read_raw() -> str | None:
     """mac:从登录钥匙串读取 Claude Code 凭证原文(service 名个别版本不一致,逐个尝试)。"""
     global _keychain_service
-    import subprocess
-    for service in ("Claude Code-credentials", "Claude Code"):
-        try:
-            p = subprocess.run(
-                ["security", "find-generic-password", "-s", service, "-w"],
-                capture_output=True, text=True, timeout=8)
-        except Exception:
-            continue
-        out = (p.stdout or "").strip()
-        if p.returncode == 0 and out:
+    for service in ((_keychain_service,) if _keychain_service else ()) + ("Claude Code-credentials", "Claude Code"):
+        out = _keychain_read_service(service)
+        if out:
             _keychain_service = service
             return out
     return None
 
 
-def _keychain_write_raw(payload: str) -> bool:
-    """mac:把续期后的凭证写回钥匙串(-U 覆盖同名项,账户名沿用原条目)。"""
+def _keychain_account(service: str) -> str:
+    """沿用原条目的账户名(读不到就用当前用户名)。"""
     import subprocess
-    service = _keychain_service or "Claude Code-credentials"
     acct = os.environ.get("USER") or ""
     try:
         p = subprocess.run(["security", "find-generic-password", "-s", service],
@@ -468,17 +655,38 @@ def _keychain_write_raw(payload: str) -> bool:
                 break
     except Exception:
         pass
+    return acct
+
+
+def _keychain_write_raw(payload: str) -> bool:
+    """mac:把续期后的凭证写回钥匙串(-U 覆盖同名项),写完读回校验。
+       优先经 `security -i` 的标准输入传十六进制数据(-X),凭证不会出现在进程命令行里
+       (命令行参数对本机其它用户的 ps 可见);数据过长(stdin 单行有长度上限)才退回 -w 参数。"""
+    import subprocess
+    service = _keychain_service or "Claude Code-credentials"
+    acct = _keychain_account(service)
+
+    def quote(s: str) -> str:
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    line = f"add-generic-password -U -a {quote(acct)} -s {quote(service)} -X {payload.encode('utf-8').hex()}\n"
+    if len(line) < 4000:
+        try:
+            subprocess.run(["security", "-i"], input=line, capture_output=True, text=True, timeout=10)
+        except Exception:
+            pass
+        if _keychain_read_service(service) == payload:
+            return True
     try:
         p = subprocess.run(["security", "add-generic-password", "-U",
                             "-s", service, "-a", acct, "-w", payload],
                            capture_output=True, text=True, timeout=8)
-        return p.returncode == 0
     except Exception:
         return False
+    return p.returncode == 0 and _keychain_read_service(service) == payload
 
 
-def _claude_load() -> tuple[dict | None, str | None]:
-    """读取完整 Claude 凭证。返回 (creds, source),source ∈ {'file', 'keychain', None}。"""
+def _claude_load_uncached() -> tuple[dict | None, str | None]:
     try:
         creds = json.loads(CREDENTIALS.read_text(encoding="utf-8"))
         if creds.get("claudeAiOauth", {}).get("accessToken"):
@@ -498,15 +706,39 @@ def _claude_load() -> tuple[dict | None, str | None]:
     return None, None
 
 
+_cli_cache: dict = {"creds": None, "source": None, "stamp": None, "t": 0.0}
+
+
+def _claude_load(fresh: bool = False) -> tuple[dict | None, str | None]:
+    """读取完整 Claude 凭证。返回 (creds, source),source ∈ {'file', 'keychain', None}。
+       带内存缓存:凭证文件按 (mtime, size) 判断是否变化(一次 stat 的开销);
+       钥匙串 / 未找到按 KEYCHAIN_CACHE_TTL 过期。fresh=True 强制重读。"""
+    try:
+        st = CREDENTIALS.stat()
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    c = _cli_cache
+    if (not fresh and c["t"] and stamp == c["stamp"]
+            and (c["source"] == "file" or time.time() - c["t"] < KEYCHAIN_CACHE_TTL)):
+        return c["creds"], c["source"]
+    creds, source = _claude_load_uncached()
+    c.update(creds=creds, source=source, stamp=stamp, t=time.time())
+    return creds, source
+
+
 def _claude_persist(creds: dict, source: str | None) -> None:
     """把续期后的凭证写回原存储;钥匙串写失败时落盘到官方 SSH 回退位置,避免丢失轮换后的 refreshToken。"""
-    if source == "keychain" and _keychain_write_raw(json.dumps(creds, ensure_ascii=False)):
-        return
     try:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        _atomic_write_json(CREDENTIALS, creds)
-    except Exception:
-        pass
+        if source == "keychain" and _keychain_write_raw(json.dumps(creds, ensure_ascii=False)):
+            return
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            _atomic_write_json(CREDENTIALS, creds)
+        except Exception:
+            pass
+    finally:
+        _cli_cache["t"] = 0.0  # 存储已变,下次重读
 
 
 _claude_refresh_block_until = 0.0
@@ -525,12 +757,15 @@ def _claude_refresh(creds: dict, source: str | None) -> str | None:
     err = "token 续期失败,稍后自动重试"
     for url in CLAUDE_TOKEN_URLS:
         try:
-            r = requests.post(url, json=body, timeout=15, headers={"User-Agent": user_agent()})
+            r = _http("claude").post(url, json=body, timeout=15, headers={"User-Agent": user_agent()})
         except requests.RequestException:
-            err = "网络连接失败,重试中…"
+            err = NET_ERR
             continue
         if r.ok:
-            d = r.json()
+            try:
+                d = r.json()
+            except ValueError:
+                d = {}
             if not d.get("access_token"):
                 err = "token 续期响应异常,稍后重试"
                 continue
@@ -558,46 +793,67 @@ def _claude_bearer_headers(tok: str) -> dict:
     }
 
 
-def claude_headers(force_refresh: bool = False):
-    """返回 (headers, error, plan)。取"最新鲜的有效令牌":
-       桌面版令牌(持续自动续期,只读)与 CLI 凭证文件二选其新;都过期时才用 refreshToken 续期。
-       force_refresh=True(收到 401 后)跳过刚被拒的桌面令牌,直接走 CLI 凭证续期。"""
+def _cli_info(creds: dict | None):
+    """(accessToken, 过期时间戳秒 / 0=未知, 套餐徽标)。"""
+    oauth = (creds or {}).get("claudeAiOauth") or {}
+    exp = float(oauth.get("expiresAt") or 0)
+    exp = exp / 1000.0 if exp > 1e12 else exp
+    return (oauth.get("accessToken"), exp,
+            CLAUDE_PLAN_BADGES.get(str(oauth.get("subscriptionType") or "").lower()))
+
+
+_claude_last_source = "—"  # 最近一次使用的令牌来源(仅用于 --check 诊断)
+
+
+def claude_headers(rejected: frozenset | set = frozenset()):
+    """返回 (headers, error, plan)。按开销从低到高挑一个可用令牌:
+         1. CLI 凭证(文件 / mac 钥匙串)当前有效 → 直接用(有缓存,几乎零开销)
+         2. 桌面版令牌有效 → 用它(桌面版自己续期,不必动 CLI 的 refreshToken)
+         3. 用 refreshToken 续期 CLI 凭证并写回
+         4. 兜底:任何还没被拒绝过的桌面令牌(即便临期,也比无令牌强)
+       rejected = 本轮已被服务端以 401 拒绝的 token,会被跳过。"""
+    global _claude_last_source
     now = time.time()
-    if not force_refresh:
-        desk_valid = [d for d in _claude_desktop_tokens() if d["expiresAt"] > now + 60]
-        if desk_valid:
-            best = max(desk_valid, key=lambda d: d["expiresAt"])
-            return _claude_bearer_headers(best["token"]), None, best.get("plan")
+
+    def usable(tok, exp):  # exp=0 表示凭证里没写过期时间(老格式):当作可用,401 时再续期
+        return bool(tok) and tok not in rejected and (not exp or exp - now >= 120)
 
     creds, source = _claude_load()
-    if creds:
-        oauth = creds.get("claudeAiOauth", {})
-        plan = CLAUDE_PLAN_BADGES.get(str(oauth.get("subscriptionType") or "").lower())
-        exp = float(oauth.get("expiresAt") or 0)
-        exp_s = exp / 1000.0 if exp > 1e12 else exp
-        if force_refresh or (exp_s and exp_s - now < 120):
-            err = _claude_refresh(creds, source)
-            if err and (force_refresh or not exp_s or exp_s <= now):
-                # CLI 续期失败:退回任何还能用的桌面令牌(即便临期,也比无令牌强)
-                desk = _claude_desktop_tokens()
-                if desk:
-                    best = max(desk, key=lambda d: d["expiresAt"])
-                    return _claude_bearer_headers(best["token"]), None, best.get("plan")
-                return None, err, plan
-        tok = creds.get("claudeAiOauth", {}).get("accessToken")
+    tok, exp, plan = _cli_info(creds)
+    if not usable(tok, exp) and creds:  # 缓存里的临期/被拒 → 重读一次存储:CLI 可能刚自己续期过
+        creds, source = _claude_load(fresh=True)
+        tok, exp, plan = _cli_info(creds)
+    if usable(tok, exp):
+        _claude_last_source = f"CLI 凭证({'钥匙串' if source == 'keychain' else '文件'})"
         return _claude_bearer_headers(tok), None, plan
 
-    # 无 CLI 凭证:最后再看桌面令牌(含已过期的兜底)
-    desk = _claude_desktop_tokens()
+    desk = [d for d in _claude_desktop_tokens() if d["token"] not in rejected]
+    valid = [d for d in desk if d["expiresAt"] > now + 60]
+    if valid:
+        best = max(valid, key=lambda d: d["expiresAt"])
+        _claude_last_source = "桌面版令牌"
+        return _claude_bearer_headers(best["token"]), None, best.get("plan")
+
+    err = None
+    if creds:
+        err = _claude_refresh(creds, source)
+        if err is None:
+            tok, exp, plan2 = _cli_info(creds)
+            _claude_last_source = "CLI 凭证(刚续期)"
+            return _claude_bearer_headers(tok), None, plan2 or plan
+        if tok and tok not in rejected and exp > now:  # 续期失败但旧 token 还没真正过期 → 先用着
+            _claude_last_source = "CLI 凭证(临期)"
+            return _claude_bearer_headers(tok), None, plan
     if desk:
         best = max(desk, key=lambda d: d["expiresAt"])
+        _claude_last_source = "桌面版令牌(兜底)"
         return _claude_bearer_headers(best["token"]), None, best.get("plan")
-    return None, "未找到登录凭证:打开一次 Claude 桌面版,或在终端运行一次 claude 登录", None
+    return None, err or "未找到登录凭证:打开一次 Claude 桌面版,或在终端运行一次 claude 登录", plan
 
 
 def fetch_profile(headers: dict) -> dict | None:
     try:
-        r = requests.get(API_URL_PROFILE, headers=headers, timeout=10)
+        r = _http("claude").get(API_URL_PROFILE, headers=headers, timeout=10)
         r.raise_for_status()
         return r.json()
     except Exception:
@@ -611,24 +867,25 @@ _profile_tried = False
 def fetch_claude() -> dict:
     """拉取 Claude 用量。返回 {"windows": [(key, util, resets_at, label)], "plan": …} 或 {"error": …}。"""
     global _profile_plan, _profile_tried
-    h, err, plan = claude_headers()
-    if not h:
-        return {"error": err}
+    s = _http("claude")
+    rejected: set = set()
     try:
-        r = requests.get(API_URL_USAGE, headers=h, timeout=10)
-        if r.status_code == 401:  # 服务端拒绝旧 token → 强制续期后重试一次
-            h, err, plan = claude_headers(force_refresh=True)
+        for _ in range(3):  # 401 → 换下一个候选令牌(或续期)再试,最多 3 次
+            h, err, plan = claude_headers(rejected)
             if not h:
-                return {"error": err}
-            r = requests.get(API_URL_USAGE, headers=h, timeout=10)
-            if r.status_code == 401:
-                return {"error": "登录已过期:请在终端运行一次 claude 重新登录"}
+                return {"error": err, "retry_soon": err == NET_ERR}
+            r = s.get(API_URL_USAGE, headers=h, timeout=10)
+            if r.status_code != 401:
+                break
+            rejected.add(h["Authorization"][len("Bearer "):])
+        else:
+            return {"error": "登录已过期:请在终端运行一次 claude 重新登录"}
         if r.status_code == 429:
             return {"error": "请求过于频繁,稍后自动重试"}
         r.raise_for_status()
         data = r.json()
-    except requests.ConnectionError:
-        return {"error": "网络连接失败,重试中…"}
+    except (requests.ConnectionError, requests.Timeout):
+        return {"error": NET_ERR, "retry_soon": True}
     except Exception as e:
         return {"error": f"获取失败:{type(e).__name__}"}
     wins = []
@@ -666,16 +923,20 @@ def _codex_refresh(auth: dict) -> str | None:
         return "Codex token 续期失败,稍后自动重试"
     body = {"client_id": CODEX_CLIENT_ID, "grant_type": "refresh_token", "refresh_token": rt}
     try:
-        r = requests.post(CODEX_TOKEN_URL, json=body, timeout=15, headers={"User-Agent": CODEX_UA})
+        r = _http("codex").post(CODEX_TOKEN_URL, json=body, timeout=15, headers={"User-Agent": CODEX_UA})
     except requests.RequestException:
-        return "网络连接失败,重试中…"
+        return NET_ERR
     if not r.ok:
         if r.status_code in (400, 401):
             _codex_refresh_block_until = time.time() + 300
             return "Codex 凭证已失效:请运行 codex 重新登录"
         _codex_refresh_block_until = time.time() + REFRESH_RETRY_COOLDOWN
         return f"Codex token 续期失败(HTTP {r.status_code}),稍后重试"
-    d = r.json()
+    try:
+        d = r.json()
+    except ValueError:
+        _codex_refresh_block_until = time.time() + REFRESH_RETRY_COOLDOWN
+        return "Codex token 续期响应异常,稍后重试"
     for k in ("id_token", "access_token", "refresh_token"):
         if d.get(k):
             toks[k] = d[k]
@@ -712,21 +973,23 @@ def fetch_codex() -> dict:
     if exp and exp - time.time() < 120:  # 临期 → 先续期;失败且确已过期才报错
         err = _codex_refresh(auth)
         if err and exp <= time.time():
-            return {"error": err}
+            return {"error": err, "retry_soon": err == NET_ERR}
         toks = auth.get("tokens") or {}
+
+    s = _http("codex")
 
     def _get():
         headers = {"Authorization": f"Bearer {toks.get('access_token', '')}", "User-Agent": CODEX_UA}
         if toks.get("account_id"):
             headers["ChatGPT-Account-Id"] = toks["account_id"]
-        return requests.get(CODEX_USAGE_URL, headers=headers, timeout=10)
+        return s.get(CODEX_USAGE_URL, headers=headers, timeout=10)
 
     try:
         r = _get()
         if r.status_code == 401:  # 服务端拒绝旧 token → 续期后重试一次
             err = _codex_refresh(auth)
             if err:
-                return {"error": err}
+                return {"error": err, "retry_soon": err == NET_ERR}
             toks = auth.get("tokens") or {}
             r = _get()
             if r.status_code == 401:
@@ -735,8 +998,8 @@ def fetch_codex() -> dict:
             return {"error": "请求过于频繁,稍后自动重试"}
         r.raise_for_status()
         data = r.json()
-    except requests.ConnectionError:
-        return {"error": "网络连接失败,重试中…"}
+    except (requests.ConnectionError, requests.Timeout):
+        return {"error": NET_ERR, "retry_soon": True}
     except Exception as e:
         return {"error": f"获取失败:{type(e).__name__}"}
     rl = data.get("rate_limit") or {}
@@ -759,6 +1022,91 @@ def fetch_codex() -> dict:
 
 
 FETCHERS = {"claude": fetch_claude, "codex": fetch_codex}
+
+
+# ================= 开机自启 =================
+def _launch_argv() -> list[str]:
+    """自启动命令:就用当前这个解释器(装好依赖的那个)+ 本脚本的绝对路径。"""
+    # 只转绝对路径、不解析符号链接:venv 里的 python 是指向系统解释器的链接,解析后会丢掉 venv 的依赖
+    exe = os.path.abspath(sys.executable) if sys.executable else "python3"
+    if IS_WIN:
+        pyw = Path(exe).with_name("pythonw.exe")  # 无控制台窗口
+        if pyw.exists():
+            exe = str(pyw)
+    return [exe, str(Path(__file__).resolve())]
+
+
+def _autostart_file() -> Path | None:
+    if IS_MAC:
+        return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
+    if IS_LINUX:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+        return base / "autostart" / "ai-usage-card.desktop"
+    return None
+
+
+def _passthrough_env() -> dict:
+    """自启动时沿用当前设置的相关环境变量(自定义配置目录等)。"""
+    keys = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "QUOTA_CARD_OPAQUE", "QUOTA_CARD_DOCK")
+    return {k: os.environ[k] for k in keys if os.environ.get(k)}
+
+
+def autostart_enabled() -> bool:
+    if IS_WIN:
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY) as k:
+                winreg.QueryValueEx(k, AUTOSTART_NAME)
+            return True
+        except OSError:
+            return False
+    f = _autostart_file()
+    return bool(f and f.exists())
+
+
+def set_autostart(on: bool) -> bool:
+    """开启 / 关闭开机自启。成功返回 True。"""
+    try:
+        argv = _launch_argv()
+        if IS_WIN:
+            import subprocess
+            import winreg
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+                if on:
+                    winreg.SetValueEx(k, AUTOSTART_NAME, 0, winreg.REG_SZ, subprocess.list2cmdline(argv))
+                else:
+                    try:
+                        winreg.DeleteValue(k, AUTOSTART_NAME)
+                    except FileNotFoundError:
+                        pass
+            return True
+        f = _autostart_file()
+        if f is None:
+            return False
+        if not on:
+            f.unlink(missing_ok=True)
+            return True
+        f.parent.mkdir(parents=True, exist_ok=True)
+        env = _passthrough_env()
+        if IS_MAC:  # 用户级 LaunchAgent:登录图形会话时由 launchd 拉起,无终端窗口
+            import plistlib
+            plist = {"Label": LAUNCH_AGENT_LABEL, "ProgramArguments": argv, "RunAtLoad": True,
+                     "ProcessType": "Interactive", "LimitLoadToSessionType": "Aqua",
+                     "WorkingDirectory": str(Path(__file__).resolve().parent)}
+            if env:
+                plist["EnvironmentVariables"] = env
+            f.write_bytes(plistlib.dumps(plist))
+        else:
+            def q(s: str) -> str:  # .desktop Exec 字段:整个参数用双引号包住,内部 " ` $ \ 转义
+                return '"' + "".join("\\" + ch if ch in '"`$\\' else ch for ch in s) + '"'
+            args = (["env"] + [f"{k}={v}" for k, v in env.items()] if env else []) + argv
+            exec_line = " ".join(q(a) for a in args)
+            f.write_text("[Desktop Entry]\nType=Application\nName=AI Usage Card\n"
+                         f"Exec={exec_line}\nTerminal=false\nNoDisplay=true\n"
+                         "X-GNOME-Autostart-enabled=true\n", encoding="utf-8")
+        return True
+    except Exception:
+        return False
 
 
 # ================= 展示辅助 =================
@@ -820,6 +1168,102 @@ def round_rect(cv: tk.Canvas, x1, y1, x2, y2, r, **kw):
     return cv.create_polygon(pts, smooth=True, **kw)
 
 
+_TRAY_FONT_FILES = (
+    # Windows
+    "C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/arialbd.ttf",
+    # macOS
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf", "/Library/Fonts/Arial Bold.ttf",
+    "/System/Library/Fonts/SFNS.ttf", "/System/Library/Fonts/Helvetica.ttc",
+    # Linux
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf", "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _tray_font_path() -> str | None:
+    for fp in _TRAY_FONT_FILES:
+        if os.path.isfile(fp):
+            return fp
+    return None
+
+
+@functools.lru_cache(maxsize=64)
+def _tray_font(size: int):
+    """托盘图标用的粗体数字字体(按字号缓存,避免每次重绘都重新解析字体文件)。"""
+    from PIL import ImageFont
+    fp = _tray_font_path()
+    if fp:
+        try:
+            return ImageFont.truetype(fp, size)
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default(size=size)  # Pillow ≥ 10.1 支持可缩放的默认字体
+    except TypeError:
+        return ImageFont.load_default()
+
+
+class _Wakeup:
+    """后台线程 → Tk 主线程的唤醒通道。
+       mac/Linux:自管道 + Tcl 文件事件,有消息时才唤醒主循环,空闲时零轮询(省电);
+       Windows(Tk 不支持文件事件)或创建失败时,退回定时轮询队列。"""
+
+    def __init__(self, root: tk.Tk, callback):
+        self._root = root
+        self._r = self._w = None
+        if IS_WIN:
+            return
+        try:
+            r, w = os.pipe()
+            os.set_blocking(r, False)
+            os.set_blocking(w, False)
+
+            def on_readable(*_):
+                try:
+                    while os.read(r, 4096):
+                        pass
+                except (BlockingIOError, InterruptedError):
+                    pass
+                except OSError:
+                    return
+                callback()
+
+            root.tk.createfilehandler(r, tk.READABLE, on_readable)
+            self._r, self._w = r, w
+        except Exception:
+            self._r = self._w = None
+
+    @property
+    def active(self) -> bool:
+        return self._w is not None
+
+    def notify(self) -> None:
+        if self._w is not None:
+            try:
+                os.write(self._w, b"!")
+            except (BlockingIOError, InterruptedError):
+                pass  # 管道已满 = 主线程本来就会被唤醒
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        r, w, self._r, self._w = self._r, self._w, None, None
+        if r is None:
+            return
+        try:
+            self._root.tk.deletefilehandler(r)
+        except Exception:
+            pass
+        for fd in (r, w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 # ================= 主程序 =================
 class QuotaCard:
     _CURSORS = {"l": "sb_h_double_arrow", "r": "sb_h_double_arrow",
@@ -829,8 +1273,8 @@ class QuotaCard:
 
     def __init__(self):
         cfg = self._load_cfg()
-        self.zoom = float(cfg.get("zoom", 1.0))
-        self.alpha = float(cfg.get("alpha", 0.97))
+        self.zoom = max(MIN_ZOOM, min(MAX_ZOOM, float(cfg.get("zoom", 1.0))))
+        self.alpha = max(0.4, min(1.0, float(cfg.get("alpha", 0.97))))
         self.pinned = bool(cfg.get("pinned", True))
         self.hidden = set(cfg.get("hidden", []))
         self.reset_mode = cfg.get("reset_mode", "clock")
@@ -845,51 +1289,17 @@ class QuotaCard:
         _resolve_font(self.root)
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", self.pinned)
-
-        # 透明/圆角:按平台选最稳妥的方案
-        #   Windows -> 洋红色键(-transparentcolor):真透明、圆角
-        #   macOS   -> systemTransparent 背景:真透明、圆角
-        #   Linux   -> 无色键,退化为不透明卡片(方角),仍可整体半透明
-        # 设环境变量 QUOTA_CARD_OPAQUE=1 可在任意系统强制不透明(用于排查显示异常)。
-        canvas_bg = C_CARD
-        force_opaque = bool(os.environ.get("QUOTA_CARD_OPAQUE"))
-        if not force_opaque and IS_WIN:
-            try:
-                self.root.attributes("-transparentcolor", TRANSPARENT)
-                canvas_bg = TRANSPARENT
-            except Exception:
-                canvas_bg = C_CARD
-        elif not force_opaque and IS_MAC:
-            try:
-                self.root.configure(bg="systemTransparent")
-                canvas_bg = "systemTransparent"
-            except Exception:
-                canvas_bg = C_CARD
-        else:
-            try:
-                self.root.configure(bg=C_CARD)
-            except Exception:
-                pass
-            canvas_bg = C_CARD
+        canvas_bg = self._setup_transparency()
         try:
             self.root.attributes("-alpha", self.alpha)
         except Exception:
             pass
 
         self._cur_w = self._cur_h = -1
+        self._pos = (0, 0)
         self.canvas = tk.Canvas(self.root, bg=canvas_bg, highlightthickness=0,
                                 width=self.s(BW), height=self.s(120))
         self.canvas.pack(fill="both", expand=True)
-        self._place_window(cfg)
-
-        self.canvas.bind("<Button-1>", self._on_press)
-        self.canvas.bind("<B1-Motion>", self._on_drag)
-        self.canvas.bind("<ButtonRelease-1>", self._on_release)
-        self.canvas.bind("<Button-3>", lambda *_: self.open_menu())
-        self.canvas.bind("<Motion>", self._on_motion)
-        self.canvas.bind("<Leave>", lambda *_: self._set_cursor(""))
-        self.canvas.bind("<MouseWheel>", self._on_wheel)
-        self.root.bind("<MouseWheel>", self._on_wheel)
 
         self.state = {p: None for p in PROVIDERS}
         self._buttons = []
@@ -899,16 +1309,34 @@ class QuotaCard:
         self._cursor = None
         self._moved = False
         self._hidden_card = False
+        self._sig = None             # 上一次整卡重绘时的布局签名
+        self._dyn_status = None      # 每秒只改文字的画布项:底部状态 / 底部时钟 / 各行重置时间
+        self._dyn_clock = None
+        self._dyn_resets: list = []
+        self._dyn_last: dict = {}
+        self._save_id = None
+        self._wheel_t = 0.0
+        self._wheel_acc = 0
+        self._last_tick = 0.0
+        self._tick_id = None
         self._refresh_evt = threading.Event()
         self._stop = False
         self.cmd_q: queue.Queue = queue.Queue()
+        self._wake = _Wakeup(self.root, self._drain_cmds)
+
+        self._place_window(cfg)
+        self._bind_events()
 
         self.tray = None
         self._tray_sig = None
+        self._mac_text_tray = False
         self._setup_tray()
+        if IS_MAC:
+            self._mac_setup()
 
-        threading.Thread(target=self._worker, daemon=True).start()
-        self._poll_cmds()
+        threading.Thread(target=self._worker, daemon=True, name="worker").start()
+        if not self._wake.active:
+            self._poll_cmds()
         self._tick()
         self.root.mainloop()
 
@@ -919,13 +1347,122 @@ class QuotaCard:
     def f(self, px: int, weight: str = "normal"):
         return (FONT, -int(round(px * SCALE * self.zoom)), weight)
 
+    # ---- 窗口外观 ----
+    def _setup_transparency(self) -> str:
+        """透明/圆角:按平台选最稳妥的方案,返回画布背景色。
+             Windows -> 洋红色键(-transparentcolor):真透明、圆角
+             macOS   -> -transparent + systemTransparent 背景:真透明、圆角(两者缺一不可)
+             Linux   -> 无色键,退化为不透明卡片(方角),仍可整体半透明
+           设环境变量 QUOTA_CARD_OPAQUE=1 可在任意系统强制不透明(用于排查显示异常)。"""
+        force_opaque = bool(os.environ.get("QUOTA_CARD_OPAQUE"))
+        if not force_opaque and IS_WIN:
+            try:
+                self.root.attributes("-transparentcolor", TRANSPARENT)
+                return TRANSPARENT
+            except Exception:
+                pass
+        elif not force_opaque and IS_MAC:
+            try:
+                self.root.attributes("-transparent", True)
+                self.root.configure(bg="systemTransparent")
+                return "systemTransparent"
+            except Exception:
+                pass
+        try:
+            self.root.configure(bg=C_CARD)
+        except Exception:
+            pass
+        return C_CARD
+
+    def _bind_events(self):
+        cv = self.canvas
+        cv.bind("<Button-1>", self._on_press)
+        cv.bind("<B1-Motion>", self._on_drag)
+        cv.bind("<ButtonRelease-1>", self._on_release)
+        cv.bind("<Motion>", self._on_motion)
+        cv.bind("<Leave>", lambda *_: self._set_cursor(""))
+        # 右键菜单:mac 上 Tk 8.6 的右键 / 双指轻点是 Button-2(8.7+ 才统一为 Button-3),
+        # 另按 mac 习惯支持 Control+单击
+        for seq in (("<Button-3>", "<Button-2>", "<Control-Button-1>") if IS_MAC else ("<Button-3>",)):
+            cv.bind(seq, self._on_menu_click)
+        # 滚轮只绑在顶层窗口:画布的 bindtags 本就包含顶层,两处都绑会让一格滚轮生效两次
+        self.root.bind("<MouseWheel>", self._on_wheel)
+        if IS_LINUX:  # X11 上 Tk 8.6 的滚轮是 Button-4/5
+            self.root.bind("<Button-4>", self._on_wheel)
+            self.root.bind("<Button-5>", self._on_wheel)
+
+    # ---- macOS 适配 ----
+    def _mac_setup(self):
+        r = self.root
+        for name, fn in (("::tk::mac::Quit", self.quit),                  # ⌘Q / 注销 / 关机 → 保存后退出
+                         ("::tk::mac::ReopenApplication", self._show_card)):  # 点 Dock 图标 → 显示卡片
+            try:
+                r.createcommand(name, fn)
+            except Exception:
+                pass
+        # 有菜单栏图标时隐藏 Dock 图标(像原生菜单栏小工具);QUOTA_CARD_DOCK=1 可保留 Dock 图标
+        if self.tray and not os.environ.get("QUOTA_CARD_DOCK"):
+            ak = _appkit()
+            if ak:
+                try:
+                    ak.NSApplication.sharedApplication().setActivationPolicy_(
+                        ak.NSApplicationActivationPolicyAccessory)
+                except Exception:
+                    pass
+        r.after(300, self._mac_apply_window_flags)
+
+    def _mac_apply_window_flags(self):
+        """置顶时让卡片出现在所有桌面(Spaces)并可浮在全屏 App 之上;取消置顶则恢复默认。"""
+        ak = _appkit() if IS_MAC else None
+        if not ak:
+            return
+        try:
+            join_all = ak.NSWindowCollectionBehaviorCanJoinAllSpaces
+            aux = ak.NSWindowCollectionBehaviorFullScreenAuxiliary
+            move = ak.NSWindowCollectionBehaviorMoveToActiveSpace
+            for w in ak.NSApplication.sharedApplication().windows() or []:
+                if not str(w.className()).startswith("TK"):  # 只动 Tk 自己的窗口,不碰菜单栏图标的窗口
+                    continue
+                cur = int(w.collectionBehavior())
+                new = ((cur & ~move) | join_all | aux) if self.pinned else (cur & ~(join_all | aux))
+                if new != cur:
+                    w.setCollectionBehavior_(new)
+        except Exception:
+            pass
+
+    def _mac_status_title(self, text: str, rgb) -> bool:
+        """mac 菜单栏:直接把百分比画成彩色文字(清晰、跟随系统字体),替代被缩成 22px 的位图。"""
+        ak = _appkit()
+        item = getattr(self.tray, "_status_item", None)
+        if not ak or item is None:
+            return False
+        try:
+            btn = item.button()
+            size = ak.NSFont.menuBarFontOfSize_(0).pointSize()
+            weight = getattr(ak, "NSFontWeightSemibold", 0.3)
+            font = ak.NSFont.monospacedDigitSystemFontOfSize_weight_(size, weight)
+            color = ak.NSColor.colorWithSRGBRed_green_blue_alpha_(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255, 1.0)
+            attrs = {ak.NSForegroundColorAttributeName: color, ak.NSFontAttributeName: font}
+            btn.setAttributedTitle_(ak.NSAttributedString.alloc().initWithString_attributes_(text, attrs))
+            if btn.image() is not None:
+                btn.setImage_(None)
+            return True
+        except Exception:
+            return False
+
     # ---- 后台轮询 ----
+    def _post(self, cmd: str):
+        """任何线程都可调用:把命令交给 Tk 主线程执行。"""
+        self.cmd_q.put(cmd)
+        self._wake.notify()
+
     def _worker(self):
         while not self._stop:
-            for p in PROVIDERS:
-                if not self.providers.get(p) or self._stop:
-                    continue
-                res = FETCHERS[p]()
+            active = {p: FETCHERS[p] for p in PROVIDERS if self.providers.get(p)}
+            soon = False
+            for p, res in _run_parallel(active):  # 各数据源并发拉取,谁先回来谁先上屏
+                if self._stop:
+                    return
                 old = self.state.get(p) or {}
                 if "windows" in res:
                     cur = {"windows": res["windows"], "plan": res.get("plan") or old.get("plan"),
@@ -933,29 +1470,62 @@ class QuotaCard:
                 else:  # 失败时保留上一次数据,只标注错误
                     cur = {"windows": old.get("windows") or [], "plan": old.get("plan"),
                            "error": res.get("error"), "updated": old.get("updated", 0)}
+                    soon = soon or bool(res.get("retry_soon"))
                 self.state = {**self.state, p: cur}
-            self._refresh_evt.wait(REFRESH_INTERVAL)
+                self._post("data")
+            self._refresh_evt.wait(ERROR_RETRY_INTERVAL if soon else REFRESH_INTERVAL)
             self._refresh_evt.clear()
 
     def _tick(self):
+        """每秒一次,对齐到整秒(底部时钟准点跳动);卡片隐藏时放慢到 5 秒。"""
         if self._stop:
             return
+        self._drain_cmds()  # 兜底:万一唤醒管道没触发,托盘命令最多延迟 1 秒也会被执行
+        if self._stop:
+            return
+        now = time.time()
+        if self._last_tick and now - self._last_tick > 30:  # 墙钟跳变 → 多半刚从睡眠唤醒:立即刷新
+            self.refresh_now()
+        self._last_tick = now
         if not self._hidden_card:
             self.render()
-        self.root.after(1000, self._tick)
+            delay = 1000 - int(now * 1000) % 1000 + 10
+        else:
+            delay = 5000
+        self._tick_id = self.root.after(delay, self._tick)
 
-    def _poll_cmds(self):
-        if self._stop:
-            return
+    def _restart_tick(self):
+        """卡片重新显示时立刻恢复每秒节拍(否则要等隐藏期间排好的 5 秒节拍,时钟会停顿)。"""
+        if self._tick_id is not None:
+            try:
+                self.root.after_cancel(self._tick_id)
+            except Exception:
+                pass
+        self._tick_id = self.root.after(0, self._tick)
+
+    def _drain_cmds(self):
         try:
             while True:
-                cmd, _ = self.cmd_q.get_nowait()
-                {"toggle_card": self.toggle_card, "refresh": self.refresh_now,
-                 "quit": self.quit}.get(cmd, lambda: None)()
+                cmd = self.cmd_q.get_nowait()
+                {"data": self._on_data, "toggle_card": self.toggle_card, "refresh": self.refresh_now,
+                 "reset_pos": self.reset_position, "quit": self.quit}.get(cmd, lambda: None)()
+                if self._stop:
+                    return
         except queue.Empty:
             pass
+
+    def _poll_cmds(self):  # 仅在没有唤醒管道时使用(Windows)
+        if self._stop:
+            return
+        self._drain_cmds()
         if not self._stop:
-            self.root.after(120, self._poll_cmds)
+            self.root.after(150, self._poll_cmds)
+
+    def _on_data(self):
+        if self._hidden_card:
+            self._update_tray()  # 卡片藏在托盘里时,托盘数字照样要跟着更新
+        else:
+            self.render()
 
     # ---- 绘制 ----
     def _sections(self):
@@ -971,14 +1541,54 @@ class QuotaCard:
                         "shown": [w for w in wins if w[0] not in self.hidden]})
         return out
 
-    def render(self):
+    def _layout_sig(self, secs):
+        """决定是否需要整卡重绘的签名:只含会改变布局/图形的量;
+           "N 秒前更新"、时钟、倒计时这类每秒都变的文字不在其中,走 _update_dynamic 原地改字。"""
+        return (self.zoom, self.pinned, self.reset_mode,
+                tuple((s_["p"], s_["plan"], s_["error"], bool(s_["updated"]),
+                       tuple(s_["wins"]), tuple(s_["shown"])) for s_ in secs))
+
+    def render(self, force: bool = False):
+        """数据或布局变了才整卡重绘;否则只更新每秒变化的几处文字(开销降到原来的零头)。"""
+        secs = self._sections()
+        sig = self._layout_sig(secs)
+        if force or sig != self._sig:
+            self._sig = sig
+            self._draw(secs)
+            self._update_tray(secs)
+        self._update_dynamic(secs)
+
+    def _dyn_text(self, *args, **kw):
+        """创建一个之后会原地改字的文本项,并记下初始文字。"""
+        iid = self.canvas.create_text(*args, **kw)
+        self._dyn_last[iid] = kw.get("text", "")
+        return iid
+
+    def _update_dynamic(self, secs):
+        cv = self.canvas
+        last = self._dyn_last
+
+        def put(iid, text):
+            if iid is not None and last.get(iid) != text:
+                last[iid] = text
+                cv.itemconfigure(iid, text=text)
+
+        put(self._dyn_status, self._footer_status(secs)[1])
+        put(self._dyn_clock, datetime.now().strftime("%H:%M:%S"))
+        fmt = fmt_countdown if self.reset_mode == "count" else fmt_reset_clock
+        for iid, resets_at in self._dyn_resets:
+            put(iid, fmt(resets_at))
+
+    def _draw(self, secs):
         cv = self.canvas
         cv.delete("all")
         self._buttons = []
+        self._dyn_status = self._dyn_clock = None
+        self._dyn_resets = []
+        self._dyn_last = {}
 
         PAD, HEADER, ROW, FOOTER, RAD = self.s(BPAD), self.s(BHEADER), self.s(BROW), self.s(BFOOTER), self.s(BRAD)
         W = self.s(BW)
-        secs = self._sections()
         multi = len(secs) >= 2
         SEC, MSG = (self.s(BSEC) if multi else 0), self.s(BMSG)
         body = sum(SEC + (len(s_["shown"]) * ROW if s_["shown"] else MSG) for s_ in secs) or MSG
@@ -987,7 +1597,9 @@ class QuotaCard:
         if (W, H) != (self._cur_w, self._cur_h):
             self._cur_w, self._cur_h = W, H
             cv.config(width=W, height=H)
-            self.root.geometry(f"{W}x{H}+{self.root.winfo_x()}+{self.root.winfo_y()}")
+            # 只改尺寸、保留位置。原先拼上 winfo_x()/winfo_y():窗口尚未映射时(首次绘制)二者在
+            # X11 / macOS 上为 0,导致记忆的位置被重置到左上角。
+            self.root.geometry(f"{W}x{H}")
 
         round_rect(cv, self.s(1), self.s(1), W - self.s(1), H - self.s(1), RAD, fill=C_CARD, outline=C_BORDER)
 
@@ -1038,7 +1650,6 @@ class QuotaCard:
                 y += MSG
 
         self._draw_footer(cv, W, H, PAD, secs)
-        self._update_tray(secs)
 
     def _draw_badge(self, cv, x, cy, text, small=False):
         bw = self.s((10 if small else 12) + (6 if small else 7) * len(text))
@@ -1072,27 +1683,35 @@ class QuotaCard:
         cy3 = y + self.s(42)
         if self.reset_mode == "count":
             cv.create_text(PAD, cy3, text="重置", anchor="w", fill=C_DIM, font=self.f(10))
-            cv.create_text(W - PAD, cy3, text=fmt_countdown(resets_at), anchor="e", fill=C_DIM, font=self.f(10))
+            iid = self._dyn_text(W - PAD, cy3, text=fmt_countdown(resets_at), anchor="e",
+                                 fill=C_DIM, font=self.f(10))
         else:
             cv.create_text(PAD, cy3, text="重置于", anchor="w", fill=C_DIM, font=self.f(10))
-            cv.create_text(W - PAD, cy3, text=fmt_reset_clock(resets_at), anchor="e", fill=C_SUB, font=self.f(10))
+            iid = self._dyn_text(W - PAD, cy3, text=fmt_reset_clock(resets_at), anchor="e",
+                                 fill=C_SUB, font=self.f(10))
+        self._dyn_resets.append((iid, resets_at))
+
+    @staticmethod
+    def _footer_status(secs):
+        """底部状态:(圆点颜色, 文案)。颜色只取决于布局签名里的量,文案每秒可能变。"""
+        if not secs:
+            return C_DIM, "未启用数据源"
+        have_data = [s_ for s_ in secs if s_["updated"]]
+        has_err = any(s_["error"] for s_ in secs)
+        if not have_data:
+            return (C_RED, "未连接") if has_err else (C_AMBER, "正在加载…")
+        ago = int(time.time() - max(s_["updated"] for s_ in have_data))
+        text = "刚刚更新" if ago < 5 else (f"{ago} 秒前更新" if ago < 60 else f"{ago // 60} 分前更新")
+        return (C_AMBER, text + " · 可能过期") if has_err else (C_GREEN, text)
 
     def _draw_footer(self, cv, W, H, PAD, secs):
         fy = H - PAD + self.s(2)
-        have_data = [s_ for s_ in secs if s_["updated"]]
-        has_err = any(s_["error"] for s_ in secs)
-        if not secs:
-            dot, text = C_DIM, "未启用数据源"
-        elif not have_data:
-            dot, text = (C_RED, "未连接") if has_err else (C_AMBER, "正在加载…")
-        else:
-            ago = int(time.time() - max(s_["updated"] for s_ in have_data))
-            text = "刚刚更新" if ago < 5 else (f"{ago} 秒前更新" if ago < 60 else f"{ago // 60} 分前更新")
-            dot, text = (C_AMBER, text + " · 可能过期") if has_err else (C_GREEN, text)
+        dot, text = self._footer_status(secs)
         cv.create_oval(PAD, fy - self.s(3), PAD + self.s(6), fy + self.s(3), fill=dot, outline="")
-        cv.create_text(PAD + self.s(12), fy, text=text, anchor="w", fill=C_DIM, font=self.f(10))
-        cv.create_text(W - PAD, fy, text=datetime.now().strftime("%H:%M:%S"),
-                       anchor="e", fill=C_DIM, font=self.f(10))
+        self._dyn_status = self._dyn_text(PAD + self.s(12), fy, text=text, anchor="w",
+                                          fill=C_DIM, font=self.f(10))
+        self._dyn_clock = self._dyn_text(W - PAD, fy, text=datetime.now().strftime("%H:%M:%S"),
+                                         anchor="e", fill=C_DIM, font=self.f(10))
 
     def _draw_icon(self, cv, kind, cx, cy, ri, sw, col):
         """统一尺寸 / 统一线条风格(2px 圆头描边)的矢量图标。"""
@@ -1129,16 +1748,40 @@ class QuotaCard:
             import pystray
             import PIL
             _ = PIL.__version__
-        except Exception:
+        except Exception:  # 未安装,或 Linux 上没有可用的托盘后端 / 显示
             self.tray = None
             return
         menu = pystray.Menu(
-            pystray.MenuItem("显示/隐藏卡片", lambda *_: self.cmd_q.put(("toggle_card", None)), default=True),
-            pystray.MenuItem("立即刷新", lambda *_: self.cmd_q.put(("refresh", None))),
-            pystray.MenuItem("退出", lambda *_: self.cmd_q.put(("quit", None))),
+            pystray.MenuItem("显示/隐藏卡片", lambda *_: self._post("toggle_card"), default=True),
+            pystray.MenuItem("立即刷新", lambda *_: self._post("refresh")),
+            pystray.MenuItem("卡片移回屏幕", lambda *_: self._post("reset_pos")),
+            pystray.MenuItem("退出", lambda *_: self._post("quit")),
         )
-        self.tray = pystray.Icon("claude_quota", self._tray_image(0, (70, 196, 106)), "AI 用量", menu)
-        threading.Thread(target=self.tray.run, daemon=True).start()
+        icon = self._tray_image(0, (70, 196, 106))
+        extra = {}
+        ak = _appkit() if IS_MAC else None
+        if ak:  # pystray 文档要求:与其它框架共用主循环时,传入对方(此处为 Tk)的 NSApplication
+            extra["darwin_nsapplication"] = ak.NSApplication.sharedApplication()
+        self.tray = None
+        for title in ("AI 用量", "AI Usage"):  # Linux 的 xorg 后端只接受 Latin-1 标题
+            try:
+                self.tray = pystray.Icon("ai_usage_card", icon, title, menu, **extra)
+                break
+            except Exception:
+                continue
+        if self.tray is None:
+            return
+        try:
+            if IS_MAC:
+                # macOS:AppKit 只能在主线程操作,而主线程的 NSApp 事件循环已由 Tk 驱动。
+                # 原先把 tray.run 丢进子线程会在 mac 上崩溃;这里改为挂接到 Tk 的事件循环。
+                self.tray.run_detached(setup=lambda _icon: None)
+                self.tray.visible = True
+                self._mac_text_tray = self._mac_status_title("—", _hex_rgb(C_SUB))
+            else:
+                threading.Thread(target=self.tray.run, daemon=True, name="tray").start()
+        except Exception:
+            self.tray = None
 
     def _tray_image(self, util, rgb):
         from PIL import Image, ImageDraw
@@ -1150,9 +1793,9 @@ class QuotaCard:
                             fill=(27, 28, 32, 255), outline=tuple(rgb) + (255,), width=4)
         txt = f"{int(round(util))}%"
         # 自适应字号:在留白内尽量放大
-        font = self._load_font(16)
+        font = _tray_font(16)
         for size in range(46, 14, -2):
-            cand = self._load_font(size)
+            cand = _tray_font(size)
             bb = d.textbbox((0, 0), txt, font=cand)
             if bb[2] - bb[0] <= sz - 12 and bb[3] - bb[1] <= sz - 18:
                 font = cand
@@ -1162,32 +1805,28 @@ class QuotaCard:
         d.text(((sz - tw) / 2 - bb[0], (sz - th) / 2 - bb[1]), txt, font=font, fill=tuple(rgb) + (255,))
         return img
 
-    @staticmethod
-    def _load_font(size):
-        from PIL import ImageFont
-        for fp in ("C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/arialbd.ttf"):
-            try:
-                return ImageFont.truetype(fp, size)
-            except Exception:
-                pass
-        return ImageFont.load_default()
-
-    def _update_tray(self, secs):
+    def _update_tray(self, secs=None):
         if not self.tray:
             return
+        secs = self._sections() if secs is None else secs
         avail = [(s_["p"], k, u, lbl) for s_ in secs for (k, u, _r, lbl) in s_["wins"]]
         if not avail:
             return
         p, key, util, lbl = next((it for it in avail if it[1] == self.tray_key), avail[0])
         rgb = _hex_rgb(bar_color(util))
-        sig = (key, int(round(util)), rgb)
+        lines = "\n".join(f"{PROVIDER_TITLES[pp]} · {ll} {uu:.0f}%" for pp, _kk, uu, ll in avail)
+        tip = (f"AI 用量(托盘:{PROVIDER_TITLES[p]} · {lbl})\n" + lines)[:120]
+        sig = (key, int(round(util)), rgb, tip)
         if sig == self._tray_sig:
             return
         self._tray_sig = sig
         try:
-            self.tray.icon = self._tray_image(util, rgb)
-            lines = "\n".join(f"{PROVIDER_TITLES[pp]} · {ll} {uu:.0f}%" for pp, _kk, uu, ll in avail)
-            self.tray.title = (f"AI 用量(托盘:{PROVIDER_TITLES[p]} · {lbl})\n" + lines)[:120]
+            text = f"{int(round(util))}%"
+            if self._mac_text_tray and not self._mac_status_title(text, rgb):
+                self._mac_text_tray = False  # 菜单栏文字不可用 → 永久退回位图图标
+            if not self._mac_text_tray:
+                self.tray.icon = self._tray_image(util, rgb)
+            self.tray.title = tip
         except Exception:
             pass
 
@@ -1248,11 +1887,14 @@ class QuotaCard:
             newdim, base = rs["h"] + (e.y_root - rs["my"]), rs["h"]
         if base <= 0:
             return
-        self.zoom = max(MIN_ZOOM, min(MAX_ZOOM, rs["zoom"] * newdim / base))
+        zoom = max(MIN_ZOOM, min(MAX_ZOOM, rs["zoom"] * newdim / base))
+        if abs(zoom - self.zoom) < 1e-3:
+            return
+        self.zoom = zoom
         self.render()
         nx = (rs["x"] + rs["w"] - self._cur_w) if "l" in reg else rs["x"]
         ny = (rs["y"] + rs["h"] - self._cur_h) if "t" in reg else rs["y"]
-        self.root.geometry(f"+{nx}+{ny}")
+        self._move(nx, ny)
 
     # ---- 交互 ----
     def _on_press(self, e):
@@ -1263,20 +1905,20 @@ class QuotaCard:
         self._pending = None
         region = self._region(e.x, e.y)
         if region:
+            x, y = self._cur_pos()
             self._resize = {"region": region, "mx": e.x_root, "my": e.y_root,
-                            "zoom": self.zoom, "w": self._cur_w, "h": self._cur_h,
-                            "x": self.root.winfo_x(), "y": self.root.winfo_y()}
+                            "zoom": self.zoom, "w": self._cur_w, "h": self._cur_h, "x": x, "y": y}
             self._drag = None
             return
         self._moved = False
-        self._drag = (e.x_root, e.y_root, self.root.winfo_x(), self.root.winfo_y())
+        self._drag = (e.x_root, e.y_root, *self._cur_pos())
 
     def _on_drag(self, e):
         if self._resize:
             self._do_resize(e)
         elif self._drag:
             sx, sy, ox, oy = self._drag
-            self.root.geometry(f"+{ox + e.x_root - sx}+{oy + e.y_root - sy}")
+            self._move(ox + e.x_root - sx, oy + e.y_root - sy)
             self._moved = True
 
     def _on_release(self, e):
@@ -1294,11 +1936,38 @@ class QuotaCard:
             self._save_cfg()
         self._drag = None
 
+    def _on_menu_click(self, _e=None):
+        self._pending = self._drag = self._resize = None
+        self.open_menu()
+        return "break"
+
     def _on_wheel(self, e):
-        if e.state & 0x0004:  # Ctrl → 微调不透明度
-            self.set_alpha(self.alpha + (0.02 if e.delta > 0 else -0.02))
-        else:                 # 滚轮 → 缩放
-            self.set_zoom(self.zoom * (1.08 if e.delta > 0 else 1 / 1.08))
+        num = getattr(e, "num", None)
+        if num in (4, 5):  # Linux X11
+            steps = 1 if num == 4 else -1
+        elif IS_WIN:  # 累计到 ±120 才算一格:兼容高精度滚轮 / 精确式触控板的小步 delta
+            delta = int(e.delta or 0)
+            if not delta:
+                return
+            if (delta > 0) != (self._wheel_acc > 0):
+                self._wheel_acc = 0
+            self._wheel_acc += delta
+            steps = int(self._wheel_acc / 120)
+            self._wheel_acc -= steps * 120
+        else:
+            steps = 1 if (e.delta or 0) > 0 else (-1 if (e.delta or 0) < 0 else 0)
+        if not steps:
+            return
+        if not IS_WIN:  # 节流:mac 触控板一次轻扫会连发几十个滚轮事件
+            now = time.monotonic()
+            if now - self._wheel_t < WHEEL_MIN_GAP:
+                return
+            self._wheel_t = now
+        steps = max(-3, min(3, steps))
+        if e.state & WHEEL_ALPHA_MODS:  # Ctrl(mac 上 ⌘ 亦可)→ 微调不透明度
+            self.set_alpha(self.alpha + 0.02 * steps)
+        else:                           # 滚轮 → 缩放
+            self.set_zoom(self.zoom * (WHEEL_ZOOM_STEP ** steps))
 
     # ---- 菜单 ----
     def open_menu(self):
@@ -1349,7 +2018,7 @@ class QuotaCard:
                                        command=lambda k=key: self.set_tray_key(k))
             else:
                 tm.add_command(label="(暂无数据)", state="disabled")
-            m.add_cascade(label="托盘显示", menu=tm)
+            m.add_cascade(label="菜单栏显示" if IS_MAC else "托盘显示", menu=tm)
 
         # 缩放
         zm = tk.Menu(m, tearoff=0)
@@ -1377,9 +2046,12 @@ class QuotaCard:
 
         m.add_separator()
         self._pin_var = tk.BooleanVar(value=self.pinned)
-        m.add_checkbutton(label="窗口置顶", variable=self._pin_var, command=self.toggle_pin)
+        m.add_checkbutton(label="窗口置顶(所有桌面可见)" if IS_MAC else "窗口置顶",
+                          variable=self._pin_var, command=self.toggle_pin)
+        self._auto_var = tk.BooleanVar(value=autostart_enabled())
+        m.add_checkbutton(label="开机自启", variable=self._auto_var, command=self.toggle_autostart)
         if self.tray:
-            m.add_command(label="隐藏到托盘", command=self.toggle_card)
+            m.add_command(label="隐藏到菜单栏" if IS_MAC else "隐藏到托盘", command=self.toggle_card)
         m.add_command(label="退出", command=self.quit)
         self.menu = m
 
@@ -1403,7 +2075,10 @@ class QuotaCard:
         self._save_cfg()
 
     def set_alpha(self, v):
-        self.alpha = max(0.4, min(1.0, v))
+        v = max(0.4, min(1.0, v))
+        if abs(v - self.alpha) < 1e-4:
+            return
+        self.alpha = v
         self.root.attributes("-alpha", self.alpha)
         self._save_cfg()
 
@@ -1415,7 +2090,7 @@ class QuotaCard:
     def set_tray_key(self, key):
         self.tray_key = key
         self._tray_sig = None
-        self.render()
+        self._update_tray()
         self._save_cfg()
 
     def _toggle_show(self, key):
@@ -1426,25 +2101,52 @@ class QuotaCard:
     def toggle_pin(self):
         self.pinned = not self.pinned
         self.root.attributes("-topmost", self.pinned)
+        if IS_MAC:
+            self._mac_apply_window_flags()
         self.render()
         self._save_cfg()
+
+    def toggle_autostart(self):
+        want = not autostart_enabled()
+        if not set_autostart(want):
+            self.root.bell()
+
+    def _show_card(self):
+        if self._hidden_card:
+            self.toggle_card()
 
     def toggle_card(self):
         if self._hidden_card:
             self.root.deiconify()
             self.root.attributes("-topmost", self.pinned)
+            self.root.lift()
             self._hidden_card = False
-            self.render()
+            if IS_MAC:
+                self._mac_apply_window_flags()
+            self.render(force=True)
+            self._restart_tick()
         else:
             self.root.withdraw()
             self._hidden_card = True
 
-    def quit(self):
-        self._stop = True
+    def reset_position(self):
+        self._move(*self._default_pos())
+        self._show_card()
         self._save_cfg()
+
+    def quit(self):
+        if self._stop:
+            return
+        self._stop = True
+        self._refresh_evt.set()  # 让后台线程尽快结束等待
+        self._wake.close()
+        self._flush_cfg()
         if self.tray:
             try:
-                self.tray.stop()
+                if IS_MAC:
+                    self.tray.visible = False  # mac 上托盘挂在 Tk 的事件循环里,别去 stop 共享的 NSApp
+                else:
+                    self.tray.stop()
             except Exception:
                 pass
         try:
@@ -1453,32 +2155,124 @@ class QuotaCard:
             pass
 
     # ---- 工具 ----
+    def _default_pos(self):
+        return self.root.winfo_screenwidth() - self.s(BW) - self.s(24), self.s(48)
+
+    def _on_screen(self, x: int, y: int) -> bool | None:
+        """(x, y)(Tk 坐标,主屏左上角为原点)是否落在某块显示器内;判断不了返回 None。
+           用于启动时发现"外接屏拔掉后卡片跑到屏幕外"的情况。"""
+        try:
+            if IS_WIN:
+                import ctypes
+                import ctypes.wintypes as wt
+                fn = ctypes.windll.user32.MonitorFromPoint
+                fn.argtypes, fn.restype = [wt.POINT, wt.DWORD], ctypes.c_void_p
+                return bool(fn(wt.POINT(int(x), int(y)), 0))  # MONITOR_DEFAULTTONULL
+            if IS_MAC:
+                ak = _appkit()
+                screens = list(ak.NSScreen.screens() or []) if ak else []
+                if not screens:
+                    return None
+                main_h = screens[0].frame().size.height  # Cocoa 坐标原点在主屏左下角,y 向上
+                for sc in screens:
+                    fr = sc.frame()
+                    left, top = fr.origin.x, main_h - (fr.origin.y + fr.size.height)
+                    if left <= x < left + fr.size.width and top <= y < top + fr.size.height:
+                        return True
+                return False
+            # X11:一个"屏幕"覆盖所有显示器
+            return 0 <= x < self.root.winfo_screenwidth() and 0 <= y < self.root.winfo_screenheight()
+        except Exception:
+            return None
+
     def _place_window(self, cfg):
         x, y = cfg.get("x"), cfg.get("y")
+        if x is not None and y is not None and self._on_screen(int(x) + self.s(BW) // 2, int(y) + self.s(12)) is False:
+            x = y = None
         if x is None or y is None:
-            x, y = self.root.winfo_screenwidth() - self.s(BW) - self.s(24), self.s(48)
+            x, y = self._default_pos()
+        self._move(x, y)
+
+    def _move(self, x, y):
+        self._pos = (int(x), int(y))
         self.root.geometry(f"+{int(x)}+{int(y)}")
+
+    def _cur_pos(self):
+        """当前位置。无边框(overrideredirect)窗口只会被本程序移动,所以自己记录的坐标就是权威值;
+           不读 winfo_x/y:它在窗口未映射 / 已隐藏 / 刚移动尚未生效时都可能返回旧值或 0。"""
+        return self._pos
 
     def _load_cfg(self):
         try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            cfg = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            return cfg if isinstance(cfg, dict) else {}
         except Exception:
             return {}
 
     def _save_cfg(self):
+        """防抖保存:滚轮缩放 / 拖动调不透明度时会连续触发,合并成 0.6 秒后的一次写盘。"""
+        if self._save_id is not None:
+            try:
+                self.root.after_cancel(self._save_id)
+            except Exception:
+                pass
+        self._save_id = self.root.after(600, self._flush_cfg)
+
+    def _flush_cfg(self):
+        self._save_id = None
         try:
-            STATE_FILE.write_text(json.dumps({
-                "x": self.root.winfo_x(), "y": self.root.winfo_y(),
+            x, y = self._cur_pos()
+            _atomic_write_json(STATE_FILE, {
+                "x": x, "y": y,
                 "alpha": round(self.alpha, 3), "zoom": round(self.zoom, 3),
                 "pinned": self.pinned, "hidden": sorted(self.hidden),
                 "reset_mode": self.reset_mode, "tray_key": self.tray_key,
                 "providers": dict(self.providers),
-            }, ensure_ascii=False), encoding="utf-8")
+            })
         except Exception:
             pass
 
 
 # ================= 自检 =================
+def _env_report() -> list[str]:
+    import platform
+    if IS_MAC:
+        osname = f"macOS {platform.mac_ver()[0]} ({platform.machine()})"
+    elif IS_WIN:
+        osname = f"Windows {platform.release()}"
+    else:
+        osname = f"Linux {platform.release()}"
+    lines = [f"系统: {osname} · Python {platform.python_version()} · Tk {tk.TkVersion}"]
+    try:
+        import pystray  # noqa: F401
+        import PIL  # noqa: F401
+        tray = "可用"
+    except ImportError:
+        tray = "不可用(pip install pystray pillow)"
+    except Exception as e:  # 已安装但没有可用的托盘后端 / 图形显示
+        tray = f"不可用({type(e).__name__})"
+    lines.append(f"托盘: {tray}")
+    if IS_MAC:
+        lines.append(f"菜单栏文字 / 隐藏 Dock / 所有桌面: {'可用' if _appkit() else '不可用(需 PyObjC,随 pystray 安装)'}")
+    if IS_WIN:
+        cipher = "系统 BCrypt"
+    else:
+        cipher = None
+        for mod, name in (("cryptography", "cryptography"), ("Crypto", "pycryptodome")):
+            try:
+                __import__(mod)
+                cipher = name
+                break
+            except Exception:
+                pass
+        if not cipher:
+            cipher = "系统 CommonCrypto" if IS_MAC else "不可用(pip install cryptography)"
+    d = _desktop_dir()
+    desk = "已安装" if d and (d / "config.json").exists() else "未找到"
+    lines.append(f"Claude 桌面版: {desk} · 令牌解密: {cipher}")
+    return lines
+
+
 def run_check():
     rec = getattr(sys.stdout, "reconfigure", None)
     if rec:
@@ -1486,15 +2280,20 @@ def run_check():
             rec(encoding="utf-8")
         except Exception:
             pass
+    for line in _env_report():
+        print(line)
     print("Claude 凭证:", CREDENTIALS, "存在" if CREDENTIALS.exists() else "不存在")
     print("Codex 凭证:", CODEX_AUTH, "存在" if CODEX_AUTH.exists() else "不存在")
     print("User-Agent:", user_agent())
-    for name, fetch in (("Claude", fetch_claude), ("Codex", fetch_codex)):
-        res = fetch()
+    print("开机自启:", "已开启" if autostart_enabled() else "未开启")
+    results = dict(_run_parallel({"Claude": fetch_claude, "Codex": fetch_codex}))
+    for name in ("Claude", "Codex"):
+        res = results[name]
         if "error" in res:
             print(f"[{name}] 错误 -> {res['error']}")
             continue
-        print(f"[{name}] 套餐: {res.get('plan') or '—'}")
+        src = f" · 令牌来源: {_claude_last_source}" if name == "Claude" else ""
+        print(f"[{name}] 套餐: {res.get('plan') or '—'}{src}")
         for _key, util, resets_at, label in res["windows"]:
             print(f"  {label:<14} {util:5.1f}%   重置于 {fmt_reset_clock(resets_at)}")
 
@@ -1532,10 +2331,24 @@ def acquire_single_instance() -> bool:
         return True  # 出错时不阻止启动
 
 
-if __name__ == "__main__":
-    if "--check" in sys.argv:
+def _main(argv: list[str]) -> int:
+    if "--check" in argv:
         run_check()
-    elif not acquire_single_instance():
-        sys.exit(0)  # 已有实例,直接退出,不重复弹卡片
-    else:
-        QuotaCard()
+        return 0
+    if "--autostart" in argv:
+        i = argv.index("--autostart")
+        val = argv[i + 1] if i + 1 < len(argv) else ""
+        if val not in ("on", "off"):
+            print("用法: quota_card.py --autostart on|off")
+            return 2
+        ok = set_autostart(val == "on")
+        print(("开机自启已开启" if val == "on" else "开机自启已关闭") if ok else "设置开机自启失败")
+        return 0 if ok else 1
+    if not acquire_single_instance():
+        return 0  # 已有实例,直接退出,不重复弹卡片
+    QuotaCard()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv[1:]))

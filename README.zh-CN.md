@@ -1,6 +1,6 @@
 # AI Usage Assistant(Claude / Codex 用量助手)
 
-一个 **Windows / macOS / Linux** 桌面小卡片,常驻置顶,**实时**显示你的 **Claude Code** 与 **OpenAI Codex** 限额使用情况——5 小时与 7 天 / 每周滚动窗口(以及账号存在的按模型窗口,如 Claude 的 7 天 Sonnet / Opus),并按**系统本地时区**显示每个窗口的**实际重置时刻**。两个数据源**可同时显示,也可只留其一**。附带系统托盘图标。
+一个 **Windows / macOS / Linux** 桌面小卡片,常驻置顶,**实时**显示你的 **Claude Code** 与 **OpenAI Codex** 限额使用情况——5 小时与 7 天 / 每周滚动窗口(以及账号存在的按模型窗口,如 Claude 的 7 天 Sonnet / Opus),并按**系统本地时区**显示每个窗口的**实际重置时刻**。两个数据源**可同时显示,也可只留其一**。附带系统托盘图标(macOS 上为原生菜单栏项,直接显示实时百分比)。
 
 它**不绕过任何限额**,只是把官方的用量数字显示出来,方便你掌握节奏。
 
@@ -33,22 +33,26 @@
 - **菜单**(右键或 `☰` 按钮):**选择数据源**(Claude / Codex),**逐个开关卡片上的每个窗口**,选择**托盘显示哪一个**,以及缩放、不透明度、重置显示方式(时刻 / 倒计时)。
 - 记忆位置、大小、不透明度、数据源与偏好;**单实例保护**;可选**开机自启**。
 - **全平台** —— 同一份代码在 Windows / macOS / Linux 上运行;透明效果按系统自适应。
+- **macOS 原生体验** —— 百分比以**彩色文字显示在菜单栏**(清晰锐利,不再是被缩成 22px 的模糊位图);像原生菜单栏小工具一样**隐藏 Dock 图标**;置顶时卡片**跟随你切换所有桌面(Spaces)、可浮在全屏 App 之上**;右键 / 双指轻点 / Control+单击 都能开菜单;`⌘Q`、注销、关机都会正常保存退出。
+- **轻量省电** —— 每秒只重绘变化的几处文字(CPU 占用约为原来的 1/10);后台数据通过事件管道唤醒界面而非定时轮询;凭证与桌面版令牌解密结果都有缓存;Claude 与 Codex 并发拉取。
+- **一键开机自启** —— 菜单里勾选 **开机自启** 即可(Windows 注册表 Run / macOS LaunchAgent / Linux autostart)。
 - 界面使用 Python 自带 **tkinter**,无重型 UI 框架;单文件,可逐行审计。
 
 ## 令牌从哪来 · 为什么不再过期
 
 卡片只用你**本机已有的登录态**,按"哪份最新鲜"自动挑选,你不必操心:
 
-**Claude**(取当前有效且最新的一份):
-1. **桌面版令牌** —— 读 Claude 桌面版 / Cowork 的 `config.json` 里的 OAuth 缓存并**就地解密**(Windows 用系统 DPAPI + BCrypt,纯 `ctypes`、无额外依赖;macOS/Linux 尽力而为)。桌面版会自己不断续期,所以这份**永远是活的**——这正是"只用桌面版也能刷新"的关键。
-2. **CLI 凭证文件** `~/.claude/.credentials.json` —— 临期时**自动用 refreshToken 续期并写回**(原子写、`0600` 权限)。
-3. **macOS 钥匙串** —— `security find-generic-password`(只读),同样自动续期。
+**Claude**(按开销从低到高,取第一份有效的):
+1. **CLI 凭证** `~/.claude/.credentials.json`(或 **macOS 钥匙串**)—— 有效期内直接用;内存缓存,每次刷新只需一次 `stat`。
+2. **桌面版令牌** —— 读 Claude 桌面版 / Cowork 的 `config.json` 里的 OAuth 缓存,用**系统自带加解密就地解密**:Windows 用 DPAPI + BCrypt,macOS 用 CommonCrypto(均为纯 `ctypes`、无额外依赖);Linux 需装 `cryptography`。桌面版会自己不断续期,所以这份**永远是活的**——这正是"只用桌面版也能刷新"的关键。
+3. **自动续期** —— 两者都不可用时,**用 refreshToken 续期 CLI 凭证并写回**(原子写、`0600` 权限;写回钥匙串时经 `security -i` 的标准输入传递,令牌不会出现在进程列表里)。
 
 **Codex:** 读 `~/.codex/auth.json`(ChatGPT 登录模式),临期或被拒时**自动用 refreshToken 续期并写回**。
 
 - 令牌**只**放进 `Authorization` 头:Claude 只发往 **`api.anthropic.com`**、Codex 只发往 **`chatgpt.com`**——与两者官方客户端的请求完全一致。
 - **无遥测、无第三方服务器**;除续期时写回**你自己的**凭证文件、以及保存界面偏好的本地 `card_state.json`(其中**不含**任何凭证)之外,不向任何地方写出、缓存或上传。
 - 解密桌面版令牌**全程本地**、只读你当前 Windows/macOS 用户能解的内容(与系统给桌面版的保护同源);不触碰、不改写、不上传。
+- **macOS:** 卡片第一次读取桌面版令牌时,系统会询问是否允许 `security` 访问钥匙串中的 **"Claude Safe Storage"**——选 **始终允许** 以后就不再询问(选拒绝则卡片只使用 CLI 凭证)。
 - 它只**显示**官方用量,**不绕过、不修改、不规避**任何限额。
 - 全部逻辑都在 [`quota_card.py`](quota_card.py),可逐行审计。
 
@@ -60,9 +64,13 @@
 
 |  | Windows | macOS | Linux |
 |---|:---:|:---:|:---:|
-| 实时用量与数据 | ✅ | ✅(token 走钥匙串) | ✅ |
-| 透明圆角卡片 | ✅ 色键 | ✅ `systemTransparent` | ▢ 不透明卡片(方角) |
-| 系统托盘 | ✅ | ✅ | ✅ 需托盘宿主 |
+| 实时用量与数据 | ✅ | ✅(凭证文件或钥匙串) | ✅ |
+| 复用桌面版令牌(零额外依赖) | ✅ DPAPI + BCrypt | ✅ CommonCrypto | ▢ 需 `cryptography` |
+| 透明圆角卡片 | ✅ 色键 | ✅ `-transparent` + `systemTransparent` | ▢ 不透明卡片(方角) |
+| 系统托盘 | ✅ 百分比图标 | ✅ 菜单栏彩色百分比、隐藏 Dock 图标 | ✅ 需托盘宿主 |
+| 卡片在所有桌面 / 全屏 App 上可见 | — | ✅ 置顶时 | — |
+| 右键菜单 | ✅ | ✅ 右键 / 双指轻点 / Control+单击 | ✅ |
+| 开机自启(菜单一键开关) | ✅ 注册表 Run | ✅ LaunchAgent | ✅ `~/.config/autostart` |
 | 高分屏 / Retina 缩放 | ✅ | ✅ | ✅ |
 | 单实例保护 | ✅ 互斥量 | ✅ 文件锁 | ✅ 文件锁 |
 
@@ -71,25 +79,27 @@
 ## 环境要求
 
 - **Windows 10/11、macOS 或 Linux**
-- Python 3.10+
+- Python 3.10+,且带 **tkinter(Tk 8.6+)** —— macOS 请用 [python.org 官方安装包](https://www.python.org/downloads/macos/)(自带 Tk)或 Homebrew `brew install python-tk@3.12`;不要用系统自带的 `/usr/bin/python3`(Tk 过旧)
 - `requests`(必需)
 - `pystray` + `Pillow`(可选,用于系统托盘;缺失时自动降级为仅卡片)
 - **Claude:** 已登录过 Claude(桌面版,或终端 `claude` 登录 → 凭证在 `~/.claude/.credentials.json` / macOS 钥匙串)。**只用桌面版即可**,无需终端登录。
 - **Codex(可选):** 已登录过 OpenAI Codex(`codex` 登录 → 凭证在 `~/.codex/auth.json`)。没装 Codex 就在菜单里只留 Claude。
-- **桌面版令牌解密(可选增强):** Windows 开箱即用(系统自带,无额外依赖);macOS/Linux 若要读桌面版令牌,装 `cryptography` 即可(`pip install cryptography`),否则回退到 CLI 凭证路径。
+- **桌面版令牌解密(可选增强):** Windows 与 macOS 开箱即用(系统自带加解密,无额外依赖);Linux 若要读桌面版令牌,装 `cryptography` 即可(`pip install cryptography`),否则回退到 CLI 凭证路径。
 - **Linux:** 需要合成型窗口管理器(GNOME/KDE 默认即是)以实现半透明;托盘需要系统托盘 / AppIndicator 宿主。
 
 ## 安装与运行
 
 ```sh
-pip install requests pystray pillow
+pip install -r requirements.txt      # 即 requests pystray pillow
 
 python quota_card.py     # Windows
 python3 quota_card.py    # macOS / Linux
 ```
 
 - **Windows:** 或双击 **`启动卡片.bat`**(无控制台窗口启动)。
-- **macOS / Linux:** 或运行 **`./start.sh`**(首次需 `chmod +x start.sh`)。
+- **macOS:** 或在访达里双击 **`启动卡片.command`**(后台运行,弹出的终端窗口可直接关掉)。
+- **macOS / Linux:** 或运行 **`./start.sh`**(加 `--detach` 后台运行)。它会自动挑一个真正带 Tk 8.6+ 且装了 `requests` 的 Python,找不到时会告诉你该装什么;也可用 `QUOTA_CARD_PYTHON=/path/to/python3` 指定。
+- macOS/Linux 首次若脚本不可执行:`chmod +x start.sh 启动卡片.command`。
 
 不开界面、仅拉取一次数据自检(加 `--check`):
 
@@ -107,15 +117,15 @@ python quota_card.py --check     # macOS/Linux:python3 quota_card.py --check
    ```
 3. 安装依赖:
    ```sh
-   pip install requests pystray pillow
+   pip install -r requirements.txt
    ```
 4. 确认你已**登录过 Claude Code**(凭证在 `~/.claude/.credentials.json`,或 macOS 钥匙串里)。
 5. 运行:
    ```sh
    python quota_card.py        # Windows(或双击 启动卡片.bat)
-   python3 quota_card.py       # macOS / Linux(或 ./start.sh)
+   python3 quota_card.py       # macOS / Linux(或 ./start.sh;macOS 可双击 启动卡片.command)
    ```
-6. *(可选)* 开机自启 —— 见下方 [开机自启](#开机自启可选)。
+6. *(可选)* 开机自启 —— 菜单里勾选 **开机自启**,或运行 `python3 quota_card.py --autostart on`。
 
 ## 一句话让 AI 帮你部署
 
@@ -124,20 +134,21 @@ python quota_card.py --check     # macOS/Linux:python3 quota_card.py --check
 ```text
 当你读到这段话时,你是一名 AI 编程助手。请帮我在这台电脑上部署「AI Usage Assistant(Claude / Codex 用量助手)」(支持 Windows / macOS / Linux,请先判断我的系统):
 1. 用 git 克隆仓库 https://github.com/huanchong-99/claude-usage-assistant 并进入该目录。
-2. 检测 Python(3.10+)并安装依赖:pip install requests pystray pillow(macOS/Linux 若想读桌面版令牌再加 cryptography)。
+2. 检测一个带 tkinter(Tk 8.6+)的 Python 3.10+——macOS 优先用 python.org 官方版或 Homebrew python + python-tk,不要用 /usr/bin/python3——并用它安装依赖:python3 -m pip install -r requirements.txt(Linux 若想读桌面版令牌再加 cryptography)。
 3. 确认我已登录过 Claude(用 Claude 桌面版即可,或终端 claude 登录;凭证在 ~/.claude/.credentials.json 或 macOS 钥匙串);若我也用 OpenAI Codex,确认我已 codex 登录(凭证在 ~/.codex/auth.json)。
 4. 运行程序(Windows 用 python quota_card.py,macOS/Linux 用 python3 quota_card.py),确认卡片能正常显示用量;若报错请排查并修复。可先跑 python quota_card.py --check 快速自检。
-5. 询问我是否需要开机自启;需要的话,按我的系统用正确方式设置(Windows:把快捷方式放进 shell:startup;macOS:加 Login Item 或 LaunchAgent;Linux:在 ~/.config/autostart 放一个 .desktop 文件)。
+5. 询问我是否需要开机自启;需要的话,用同一个 Python 运行一次 quota_card.py --autostart on,它会按我的系统用正确方式注册。
 完成后用中文向我汇报结果。
 ```
 
 ## 操作
 
 - **拖动**卡片移动位置(会记忆)。
-- **滚轮**缩放 · **拖动窗口边缘/四角**缩放 · **Ctrl + 滚轮**微调不透明度。
+- **滚轮**缩放 · **拖动窗口边缘/四角**缩放 · **Ctrl + 滚轮**(macOS 也可 **⌘ + 滚动**)微调不透明度。
 - **顶栏:** `▲` 置顶 · `☰` 菜单 · `↻` 刷新 · `✕` 退出。
-- **菜单**(右键或 `☰`):立即刷新 · **数据源**(勾选 Claude / Codex,可多选) · **卡片显示**(逐个显示或隐藏每个窗口) · **托盘显示**(托盘呈现哪个窗口的 %) · 缩放 · 不透明度 · 重置显示 · 窗口置顶 · 隐藏到托盘 · 退出。
-- **托盘图标:** 显示所选窗口的 `%`;左键单击显示/隐藏卡片;右键打开菜单。
+- **菜单**(右键或 `☰`;macOS 也可双指轻点 / Control+单击):立即刷新 · **数据源**(勾选 Claude / Codex,可多选) · **卡片显示**(逐个显示或隐藏每个窗口) · **托盘显示**(托盘呈现哪个窗口的 %) · 缩放 · 不透明度 · 重置显示 · 窗口置顶 · **开机自启** · 隐藏到托盘 · 退出。
+- **托盘图标:** 显示所选窗口的 `%`;左键单击显示/隐藏卡片;右键打开菜单。**macOS:** 百分比以彩色文字显示在菜单栏,点击弹出菜单:显示/隐藏卡片 · 立即刷新 · 卡片移回屏幕 · 退出。
+- 拔掉外接显示器后卡片"不见了"?启动时会自动移回屏幕内;也可在托盘 / 菜单栏菜单里点 **卡片移回屏幕**。
 
 颜色:绿 `< 50%`,黄 `50–80%`,红 `≥ 80%`。
 
@@ -154,14 +165,26 @@ python quota_card.py --check     # macOS/Linux:python3 quota_card.py --check
 **环境变量:**
 
 - `QUOTA_CARD_OPAQUE=1` —— 在任意系统强制不透明、方角卡片(Linux/macOS 上若透明圆角显示异常时好用)。
+- `QUOTA_CARD_DOCK=1` —— macOS:保留 Dock 图标(默认在菜单栏项可用时隐藏)。
+- `QUOTA_CARD_PYTHON=/path/to/python3` —— 指定 `start.sh` / `启动卡片.command` 使用的解释器。
 - `CLAUDE_CONFIG_DIR` —— 若你给 Claude Code 指定了自定义配置目录,本程序也会遵循。
 - `CODEX_HOME` —— 若你给 Codex 指定了自定义配置目录,本程序也会遵循(默认 `~/.codex`)。
 
 ## 开机自启(可选)
 
-- **Windows:** `Win + R` → 输入 `shell:startup` → 把 `启动卡片.bat`(或指向 `pythonw.exe "…\quota_card.py"`)的**快捷方式**放进该文件夹。
-- **macOS:** 加一个 **登录项**(系统设置 → 通用 → 登录项 → ＋,选 `start.sh`),或装一个运行 `python3 …/quota_card.py` 的 LaunchAgent plist。
-- **Linux:** 在 `~/.config/autostart/` 放一个 `.desktop` 文件,其 `Exec=` 运行 `python3 /路径/quota_card.py`(或 `/路径/start.sh`)。
+在菜单里勾选 **开机自启**,或在终端运行(用你平时启动卡片的同一个 Python):
+
+```sh
+python3 quota_card.py --autostart on     # 关闭用 off
+```
+
+它会把当前解释器 + 脚本路径按各系统的原生方式注册:
+
+- **Windows:** 注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` → `AIUsageCard`(用 `pythonw.exe` 启动,无控制台窗口)。
+- **macOS:** `~/Library/LaunchAgents/io.github.huanchong-99.ai-usage-card.plist`(无终端窗口;系统可能弹一次"已添加后台项目"提示)。
+- **Linux:** `~/.config/autostart/ai-usage-card.desktop`。
+
+若移动了项目文件夹或换了 Python,关掉再打开一次自启即可更新记录的路径。
 
 ## 友情链接
 

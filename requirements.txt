@@ -1,0 +1,6 @@
+requests>=2.25
+# 系统托盘 / macOS 菜单栏(可选;缺失时退化为仅卡片)。macOS 上会顺带装上 PyObjC。
+pystray>=0.19
+Pillow>=9.0
+# Linux 读取 Claude 桌面版令牌需要(可选);Windows / macOS 用系统自带加解密,无需安装。
+# cryptography>=41

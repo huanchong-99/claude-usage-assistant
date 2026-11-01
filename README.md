@@ -1,6 +1,6 @@
 # AI Usage Assistant (Claude / Codex)
 
-A tiny, always-on-top desktop card for **Windows, macOS, and Linux** that shows your **Claude Code** and **OpenAI Codex** usage limits in real time — the 5-hour and 7-day / weekly rolling windows (plus per-model windows such as Claude's 7-day Sonnet / Opus), each with its **reset time in your local timezone**. Show **both sources at once, or just one**. Includes a system-tray indicator.
+A tiny, always-on-top desktop card for **Windows, macOS, and Linux** that shows your **Claude Code** and **OpenAI Codex** usage limits in real time — the 5-hour and 7-day / weekly rolling windows (plus per-model windows such as Claude's 7-day Sonnet / Opus), each with its **reset time in your local timezone**. Show **both sources at once, or just one**. Includes a system-tray indicator (on macOS: a native menu-bar item showing the live %).
 
 It does **not** bypass any limit — it just makes the official numbers visible so you can pace yourself.
 
@@ -33,22 +33,26 @@ English | [简体中文](README.zh-CN.md)
 - **Menu** (right-click or the `☰` button): **pick data sources** (Claude / Codex), **show or hide each window individually**, pick **which one the tray reflects**, plus zoom, opacity, and reset-display mode (clock vs. countdown).
 - Remembers position, size, opacity, sources, and preferences. **Single-instance guard.** Optional **autostart**.
 - **Cross-platform** — one file runs on Windows, macOS, and Linux; the transparent look adapts per OS.
+- **Native on macOS** — the live % sits in the **menu bar** as crisp colored text (not a blurry 22-px bitmap), the Dock icon is hidden like a real menu-bar utility, the pinned card **follows you across Spaces and over full-screen apps**, right-click works with two-finger tap / Control-click, and `⌘Q` / logout quit cleanly.
+- **Lightweight** — only the parts that change are redrawn each second (~10× less CPU than before), background updates wake the UI through an event pipe instead of polling, credentials and the desktop-token decryption are cached, and Claude + Codex are fetched in parallel.
+- **One-click autostart** — tick **Start at login** in the menu (Windows Run key / macOS LaunchAgent / Linux autostart entry).
 - Pure standard-library **tkinter** UI — no heavy UI framework. A single file, fully auditable.
 
 ## Where the token comes from · why it stops expiring
 
 The card only uses the login state **already on your machine**, picking whichever copy is freshest so you don't have to think about it:
 
-**Claude** (uses the currently-valid, freshest copy):
-1. **Desktop-app token** — reads the OAuth cache in the Claude desktop app / Cowork `config.json` and **decrypts it locally** (Windows: system DPAPI + BCrypt via pure `ctypes`, no extra dependency; macOS/Linux: best-effort). The desktop app keeps this refreshed, so it's **always alive** — this is what makes "refreshes even when you only use the desktop app" work.
-2. **CLI credential** `~/.claude/.credentials.json` — when near expiry, **auto-refreshed via its refreshToken and written back** (atomic write, `0600` perms).
-3. **macOS Keychain** — `security find-generic-password` (read-only), auto-refreshed the same way.
+**Claude** (cheapest valid source first):
+1. **CLI credential** `~/.claude/.credentials.json` (or the **macOS Keychain**) — used as-is while it's valid; cached in memory, so a refresh costs one `stat`.
+2. **Desktop-app token** — reads the OAuth cache in the Claude desktop app / Cowork `config.json` and **decrypts it locally** with the OS's own crypto: Windows DPAPI + BCrypt, macOS CommonCrypto (both via pure `ctypes`, no extra dependency); Linux needs `cryptography`. The desktop app keeps this refreshed, so it's **always alive** — this is what makes "refreshes even when you only use the desktop app" work.
+3. **Auto-refresh** — if neither is valid, the CLI credential is **refreshed via its refreshToken and written back** (atomic write, `0600` perms; Keychain writes go through `security -i` on stdin so the token never shows up in the process list).
 
 **Codex:** reads `~/.codex/auth.json` (ChatGPT login mode); when near expiry or rejected, **auto-refreshes via its refreshToken and writes it back**.
 
 - The token goes **only** in the `Authorization` header: Claude only to **`api.anthropic.com`**, Codex only to **`chatgpt.com`** — the same calls their official clients make.
 - **No telemetry, no third-party servers.** Nothing is written out, cached, or uploaded anywhere, except refreshing **your own** credential files and a local `card_state.json` holding UI preferences (it contains **no** credentials).
 - Decrypting the desktop token is **entirely local** and reads only what your current Windows/macOS user is already entitled to decrypt (the same protection the OS gives the desktop app); it never touches, rewrites, or uploads it.
+- **macOS:** the first time the card reads the desktop token, macOS asks whether `security` may access **"Claude Safe Storage"** — choose **Always Allow** to not be asked again (choose Deny and the card simply sticks to the CLI credential).
 - It only **displays** official usage; it does **not** bypass, modify, or work around any limit.
 - All of it lives in [`quota_card.py`](quota_card.py) — read every line.
 
@@ -60,9 +64,13 @@ This tool reads usage from `https://api.anthropic.com/api/oauth/usage` (Claude) 
 
 |  | Windows | macOS | Linux |
 |---|:---:|:---:|:---:|
-| Live usage & data | ✅ | ✅ (token via Keychain) | ✅ |
-| Transparent rounded card | ✅ color-key | ✅ `systemTransparent` | ▢ opaque card (square corners) |
-| System tray | ✅ | ✅ | ✅ with a tray host |
+| Live usage & data | ✅ | ✅ (file or Keychain) | ✅ |
+| Desktop-token reuse, zero extra deps | ✅ DPAPI + BCrypt | ✅ CommonCrypto | ▢ needs `cryptography` |
+| Transparent rounded card | ✅ color-key | ✅ `-transparent` + `systemTransparent` | ▢ opaque card (square corners) |
+| System tray | ✅ % icon | ✅ menu-bar % text, no Dock icon | ✅ with a tray host |
+| Card on all desktops / over full-screen apps | — | ✅ when pinned | — |
+| Right-click menu | ✅ | ✅ right-click / two-finger tap / Control-click | ✅ |
+| Start at login (menu toggle) | ✅ Run key | ✅ LaunchAgent | ✅ `~/.config/autostart` |
 | High-DPI / Retina scaling | ✅ | ✅ | ✅ |
 | Single-instance guard | ✅ mutex | ✅ file lock | ✅ file lock |
 
@@ -71,25 +79,27 @@ One file, no per-OS build step. On Linux the card falls back to an opaque (squar
 ## Requirements
 
 - **Windows 10/11, macOS, or Linux**
-- Python 3.10+
+- Python 3.10+ with **tkinter (Tk 8.6+)** — on macOS use the [python.org installer](https://www.python.org/downloads/macos/) (bundles Tk) or Homebrew `brew install python-tk@3.12`; avoid Apple's `/usr/bin/python3` (outdated Tk)
 - [`requests`](https://pypi.org/project/requests/) (required)
 - [`pystray`](https://pypi.org/project/pystray/) + [`Pillow`](https://pypi.org/project/pillow/) (optional — for the system tray; the app degrades to card-only if missing)
 - **Claude:** signed in to Claude at least once — **the desktop app alone is enough**, or a terminal `claude` login (token in `~/.claude/.credentials.json` / macOS Keychain).
 - **Codex (optional):** signed in to OpenAI Codex (`codex` login → `~/.codex/auth.json`). No Codex? Just leave only Claude ticked in the menu.
-- **Desktop-token decryption (optional enhancement):** works out of the box on Windows (system-provided, no extra dependency); on macOS/Linux, `pip install cryptography` enables reading the desktop token, otherwise it falls back to the CLI credential.
+- **Desktop-token decryption (optional enhancement):** works out of the box on Windows and macOS (system crypto, no extra dependency); on Linux, `pip install cryptography` enables reading the desktop token, otherwise it falls back to the CLI credential.
 - **Linux:** a compositing window manager (the default on GNOME/KDE) for the translucency; the tray needs a system-tray / AppIndicator host.
 
 ## Install & run
 
 ```sh
-pip install requests pystray pillow
+pip install -r requirements.txt      # = requests pystray pillow
 
 python quota_card.py     # Windows
 python3 quota_card.py    # macOS / Linux
 ```
 
 - **Windows:** or double-click **`启动卡片.bat`** (launches with no console window).
-- **macOS / Linux:** or run **`./start.sh`** (first time: `chmod +x start.sh`).
+- **macOS:** or double-click **`启动卡片.command`** in Finder (runs in the background; you can close the Terminal window it opens).
+- **macOS / Linux:** or run **`./start.sh`** (`--detach` to background it). It picks a Python that actually has Tk 8.6+ and `requests`, and tells you what to install if none does. Override with `QUOTA_CARD_PYTHON=/path/to/python3`.
+- First time on macOS/Linux, if the scripts aren't executable: `chmod +x start.sh 启动卡片.command`.
 
 Verify the data pull without opening the UI (add `--check`):
 
@@ -107,15 +117,15 @@ python quota_card.py --check     # macOS/Linux: python3 quota_card.py --check
    ```
 3. Install dependencies:
    ```sh
-   pip install requests pystray pillow
+   pip install -r requirements.txt
    ```
 4. Make sure you have signed in to **Claude** at least once — the **desktop app alone is enough**, or a terminal `claude` login. *(Optional: sign in to **Codex** with `codex` for the second source.)*
 5. Run it:
    ```sh
    python quota_card.py        # Windows  (or double-click 启动卡片.bat)
-   python3 quota_card.py       # macOS / Linux  (or ./start.sh)
+   python3 quota_card.py       # macOS / Linux  (or ./start.sh; macOS: double-click 启动卡片.command)
    ```
-6. *(Optional)* Autostart on boot — see [Autostart](#autostart-optional) below.
+6. *(Optional)* Start at login — tick **Start at login** in the menu, or run `python3 quota_card.py --autostart on`.
 
 ## One-paste AI setup
 
@@ -124,20 +134,21 @@ Don't want to do it by hand? Paste the block below to an AI coding assistant (e.
 ```text
 When you read this, you are an AI coding assistant. Please deploy "AI Usage Assistant (Claude / Codex)" on this machine (it supports Windows, macOS, and Linux — detect the OS first):
 1. git clone https://github.com/huanchong-99/claude-usage-assistant and cd into the folder.
-2. Detect Python (3.10+) and install dependencies: pip install requests pystray pillow (on macOS/Linux add cryptography if I want the desktop token read).
+2. Detect a Python 3.10+ that has tkinter (Tk 8.6+) — on macOS prefer the python.org build or Homebrew python + python-tk, not /usr/bin/python3 — and install dependencies with it: python3 -m pip install -r requirements.txt (on Linux also cryptography if I want the desktop token read).
 3. Confirm I have signed in to Claude (the Claude desktop app is enough, or a terminal `claude` login; token in ~/.claude/.credentials.json or the macOS Keychain). If I also use OpenAI Codex, confirm I'm logged in (`codex` → ~/.codex/auth.json).
 4. Run the app (python quota_card.py on Windows, python3 quota_card.py on macOS/Linux) and verify the card shows my usage; if it errors, diagnose and fix it. You can run `python quota_card.py --check` for a quick self-test.
-5. Ask whether I want it to start automatically on boot; if yes, set it up the right way for my OS (Windows: a shortcut in shell:startup; macOS: a Login Item or LaunchAgent; Linux: a ~/.config/autostart entry).
+5. Ask whether I want it to start automatically at login; if yes, run it once with --autostart on (using the same Python), which registers it the right way for my OS.
 Report back in my language when done.
 ```
 
 ## Controls
 
 - **Drag** the card to move it (position is remembered).
-- **Mouse-wheel** to zoom · **drag window edges/corners** to resize · **Ctrl + wheel** to fine-tune opacity.
+- **Mouse-wheel** to zoom · **drag window edges/corners** to resize · **Ctrl + wheel** (macOS: also **⌘ + scroll**) to fine-tune opacity.
 - **Top bar:** `▲` keep-on-top · `☰` menu · `↻` refresh · `✕` quit.
-- **Menu** (right-click or `☰`): Refresh · **Data sources** (tick Claude / Codex — multi-select) · **Card items** (show or hide each window) · **Tray item** (which window's % the tray shows) · Zoom · Opacity · Reset display · Keep on top · Hide to tray · Quit.
-- **Tray icon:** shows the selected window's `%`; left-click toggles the card; right-click for the menu.
+- **Menu** (right-click or `☰`; macOS: also two-finger tap / Control-click): Refresh · **Data sources** (tick Claude / Codex — multi-select) · **Card items** (show or hide each window) · **Tray item** (which window's % the tray shows) · Zoom · Opacity · Reset display · Keep on top · **Start at login** · Hide to tray · Quit.
+- **Tray icon:** shows the selected window's `%`; left-click toggles the card; right-click for the menu. **macOS:** the % is shown as colored text in the menu bar — click it for Show/Hide card · Refresh · Move card back on screen · Quit.
+- Lost the card after unplugging a monitor? It's moved back on screen automatically at startup, or use **Move card back on screen** in the tray / menu-bar menu.
 
 Bar colors: green `< 50%`, amber `50–80%`, red `≥ 80%`.
 
@@ -154,14 +165,26 @@ Preferences (position, zoom, opacity, sources, shown items, tray item, reset mod
 **Environment variables:**
 
 - `QUOTA_CARD_OPAQUE=1` — force an opaque, square-cornered card on any OS (handy on Linux/macOS if the transparent corners ever render oddly).
+- `QUOTA_CARD_DOCK=1` — macOS: keep the Dock icon (by default it's hidden while the menu-bar item is available).
+- `QUOTA_CARD_PYTHON=/path/to/python3` — which interpreter `start.sh` / `启动卡片.command` should use.
 - `CLAUDE_CONFIG_DIR` — if you point Claude Code at a custom config dir, the app honors it too.
 - `CODEX_HOME` — if you point Codex at a custom config dir, the app honors it too (default `~/.codex`).
 
 ## Autostart (optional)
 
-- **Windows:** press `Win + R`, type `shell:startup`, and drop a shortcut to `启动卡片.bat` (or to `pythonw.exe "…\quota_card.py"`) into that folder.
-- **macOS:** add a **Login Item** (System Settings → General → Login Items → ＋, pick `start.sh`), or install a LaunchAgent plist that runs `python3 …/quota_card.py`.
-- **Linux:** drop a `.desktop` file into `~/.config/autostart/` whose `Exec=` runs `python3 /path/to/quota_card.py` (or `/path/to/start.sh`).
+Tick **Start at login** in the menu, or from a terminal (use the same Python you run the card with):
+
+```sh
+python3 quota_card.py --autostart on     # off to remove
+```
+
+It registers the current interpreter + script path the native way for each OS:
+
+- **Windows:** `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` → `AIUsageCard` (runs with `pythonw.exe`, no console).
+- **macOS:** `~/Library/LaunchAgents/io.github.huanchong-99.ai-usage-card.plist` (no Terminal window; macOS may show a one-time "Background Items Added" notice).
+- **Linux:** `~/.config/autostart/ai-usage-card.desktop`.
+
+If you move the folder or switch Python, toggle it off and on again so the stored path is updated.
 
 ## Friend Links
 

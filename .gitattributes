@@ -3,6 +3,7 @@
 
 # Shell 脚本必须保持 LF(在 macOS / Linux 上运行,CRLF 会破坏 shebang)
 *.sh text eol=lf
+*.command text eol=lf
 
 # Windows 批处理保持 CRLF
 *.bat text eol=crlf
