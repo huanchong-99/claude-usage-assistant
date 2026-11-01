@@ -10,6 +10,9 @@ dist/
 # App local state — do NOT publish (window position & UI prefs)
 card_state.json
 
+# 本机排查记录(含本机环境信息)— 不发布
+issues.md
+
 # Logs
 *.log
 launch_err.log
