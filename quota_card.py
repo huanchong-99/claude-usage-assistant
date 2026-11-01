@@ -159,12 +159,15 @@ CODEX_PLAN_BADGES = {"free": "FREE", "plus": "PLUS", "pro": "PRO", "prolite": "P
 LABELS = {
     "five_hour": "5 小时",
     "seven_day": "7 天",
+    # 接口里的按模型窗口有时用内部代号作键名(如 Fable 的是 iguana_necktie),在这里映射成可读名称;
+    # 未收录的键会原样显示,在此补一行即可
+    "iguana_necktie": "7 天 · Fable",
     "seven_day_opus": "7 天 · Opus",
     "seven_day_sonnet": "7 天 · Sonnet",
     "seven_day_cowork": "7 天 · Cowork",
     "seven_day_oauth_apps": "7 天 · 应用",
 }
-ORDER = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet",
+ORDER = ["five_hour", "seven_day", "iguana_necktie", "seven_day_opus", "seven_day_sonnet",
          "seven_day_cowork", "seven_day_oauth_apps"]
 WEEK = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 

@@ -1,6 +1,6 @@
 # AI Usage Assistant (Claude / Codex)
 
-A tiny, always-on-top desktop card for **Windows, macOS, and Linux** that shows your **Claude Code** and **OpenAI Codex** usage limits in real time — the 5-hour and 7-day / weekly rolling windows (plus per-model windows such as Claude's 7-day Sonnet / Opus), each with its **reset time in your local timezone**. Show **both sources at once, or just one**. Includes a system-tray indicator (on macOS: a native menu-bar item showing the live %).
+A tiny, always-on-top desktop card for **Windows, macOS, and Linux** that shows your **Claude Code** and **OpenAI Codex** usage limits in real time — the 5-hour and 7-day / weekly rolling windows (plus per-model windows such as Claude's 7-day Fable / Opus / Sonnet), each with its **reset time in your local timezone**. Show **both sources at once, or just one**. Includes a system-tray indicator (on macOS: a native menu-bar item showing the live %).
 
 It does **not** bypass any limit — it just makes the official numbers visible so you can pace yourself.
 
