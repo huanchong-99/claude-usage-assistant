@@ -514,49 +514,82 @@ def _cbc_decrypt(key: bytes, iv: bytes, ct: bytes) -> bytes | None:
     return pt[:-pad] if 1 <= pad <= 16 else pt
 
 
-_ss_key_cache: dict = {}  # {数据目录: (key, algo) 或 None(尝试过但不可用)}
+_ss_key_cache: dict = {}  # {数据目录: (key, algo),或 None = 确定不可用(没有该钥匙串条目 / 用户点了拒绝)}
+_ss_retry_at: dict = {}   # {数据目录: 时间戳}:临时失败(授权框没人点、界面暂不可用)后,到点再试
+KEY_RETRY_AFTER = 1800    # 临时失败后的重试间隔(秒)
+_DESK_DIAG: dict = {}     # 桌面版令牌最近一次读取的诊断信息(--check 展示)
+_ss_key_reason: dict = {} # {数据目录: 最近一次取密钥的结果说明}
 
 
 def _safestorage_key(d: Path):
-    """返回 (aes_key, 'gcm'|'cbc') 或 None。密钥在一个进程内稳定,按数据目录缓存一次即可
-       (避免每 60 秒刷新都读一次 Local State / mac 钥匙串反复弹授权框)。"""
+    """返回 (aes_key, 'gcm'|'cbc') 或 None。密钥在一个进程内稳定,成功后按数据目录缓存
+       (避免每 60 秒都读 Local State / 让 mac 钥匙串反复弹授权框)。
+       失败分两种:确定不可用的,本次运行不再尝试;临时失败的(如开机时授权框没人点),
+       过 KEY_RETRY_AFTER 秒再试——原先任何失败都会让桌面令牌在整个运行期间失效。"""
     k = str(d)
-    if k not in _ss_key_cache:
-        _ss_key_cache[k] = _compute_safestorage_key(d)
-    return _ss_key_cache[k]
+    if k in _ss_key_cache:
+        return _ss_key_cache[k]
+    if time.time() < _ss_retry_at.get(k, 0):
+        return None
+    keyinfo, permanent = _compute_safestorage_key(d)
+    _ss_key_reason[k] = _DESK_DIAG.get("key")
+    if keyinfo or permanent:
+        _ss_key_cache[k] = keyinfo
+        _ss_retry_at.pop(k, None)
+    else:
+        _ss_retry_at[k] = time.time() + KEY_RETRY_AFTER
+    return keyinfo
 
 
 def _compute_safestorage_key(d: Path):
-    """Windows=DPAPI 解出的 32 字节 GCM 密钥;mac/Linux=PBKDF2 派生 16 字节 CBC 密钥。"""
+    """返回 (keyinfo 或 None, 失败是否确定不可恢复)。
+       Windows=DPAPI 解出的 32 字节 GCM 密钥;mac/Linux=PBKDF2 派生 16 字节 CBC 密钥。"""
     if not d:
-        return None
+        return None, True
     if IS_WIN:
         try:
             ls = json.loads((d / "Local State").read_text(encoding="utf-8"))
             import base64
             enc = base64.b64decode(ls["os_crypt"]["encrypted_key"])
             if enc[:5] != b"DPAPI":
-                return None
+                _DESK_DIAG["key"] = "Local State 格式不支持"
+                return None, True
             key = _win_dpapi_unprotect(enc[5:])
-            return (key, "gcm") if key else None
-        except Exception:
-            return None
+            _DESK_DIAG["key"] = "正常" if key else "DPAPI 解密失败"
+            return ((key, "gcm") if key else None), True
+        except Exception as e:
+            _DESK_DIAG["key"] = f"读取 Local State 失败({type(e).__name__})"
+            return None, True
     # mac / Linux:PBKDF2-HMAC-SHA1(salt=b"saltysalt", dklen=16)
     try:
         import hashlib
         if IS_MAC:
-            # 首次读取时 macOS 会弹钥匙串授权框;点"始终允许"后不再询问。拒绝则本进程不再尝试。
+            # 首次读取时 macOS 会弹钥匙串授权框;点"始终允许"后不再询问
             import subprocess
-            p = subprocess.run(["security", "find-generic-password", "-w", "-s", "Claude Safe Storage"],
-                               capture_output=True, text=True, timeout=30)
+            try:
+                p = subprocess.run(["security", "find-generic-password", "-w", "-s", "Claude Safe Storage"],
+                                   capture_output=True, text=True, timeout=60)
+            except subprocess.TimeoutExpired:
+                _DESK_DIAG["key"] = "钥匙串授权框无人响应,稍后重试"
+                return None, False
+            err = (p.stderr or "").lower()
             if p.returncode != 0 or not p.stdout.strip():
-                return None
+                if "could not be found" in err:
+                    _DESK_DIAG["key"] = "钥匙串里没有「Claude Safe Storage」(桌面版未登录过?)"
+                    return None, True
+                if "cancel" in err or "denied" in err:
+                    _DESK_DIAG["key"] = "钥匙串授权被拒绝:重开卡片并在授权框点「始终允许」"
+                    return None, True
+                _DESK_DIAG["key"] = f"钥匙串暂不可用(security 退出码 {p.returncode}),稍后重试"
+                return None, False
             pw, iters = p.stdout.strip().encode(), 1003
         else:  # Linux:无 libsecret 依赖时退回默认口令 "peanuts"
             pw, iters = b"peanuts", 1
-        return (hashlib.pbkdf2_hmac("sha1", pw, b"saltysalt", iters, 16), "cbc")
-    except Exception:
-        return None
+        _DESK_DIAG["key"] = "正常"
+        return (hashlib.pbkdf2_hmac("sha1", pw, b"saltysalt", iters, 16), "cbc"), True
+    except Exception as e:
+        _DESK_DIAG["key"] = f"取密钥出错({type(e).__name__}),稍后重试"
+        return None, False
 
 
 def _desktop_decrypt(b64_value: str, keyinfo) -> bytes | None:
@@ -594,28 +627,39 @@ def _claude_desktop_tokens() -> list[dict]:
         return []
     stamp = (str(cfg_path), st.st_mtime_ns, st.st_size)
     if stamp != _desk_cache["stamp"]:
-        _desk_cache["tokens"] = _read_desktop_tokens(cfg_path)
-        _desk_cache["stamp"] = stamp
+        tokens, cacheable = _read_desktop_tokens(cfg_path)
+        _desk_cache["tokens"] = tokens
+        # 密钥临时取不到时不记 stamp:否则在桌面版改写 config.json 之前都不会再尝试
+        _desk_cache["stamp"] = stamp if cacheable else None
     return _desk_cache["tokens"]
 
 
-def _read_desktop_tokens(cfg_path: Path) -> list[dict]:
+def _read_desktop_tokens(cfg_path: Path) -> tuple[list[dict], bool]:
+    """返回 (令牌列表, 结果是否可缓存)。"""
+    _DESK_DIAG.clear()
+    _DESK_DIAG["config"] = str(cfg_path)
     try:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except Exception:
-        return []
+    except Exception as e:
+        _DESK_DIAG["error"] = f"config.json 读取失败({type(e).__name__})"
+        return [], True
     encs = [cfg.get(k) for k in ("oauth:tokenCacheV2", "oauth:tokenCache")]
     encs = [e for e in encs if isinstance(e, str) and e]
+    _DESK_DIAG["entries"] = len(encs)
     if not encs:  # 没有令牌缓存就别去取密钥(mac 上取密钥会弹钥匙串授权框)
-        return []
+        _DESK_DIAG["error"] = "config.json 里没有登录缓存(桌面版未登录?)"
+        return [], True
     keyinfo = _safestorage_key(cfg_path.parent)
     if not keyinfo:
-        return []
+        _DESK_DIAG["key"] = _ss_key_reason.get(str(cfg_path.parent)) or "不可用"
+        return [], str(cfg_path.parent) in _ss_key_cache  # 确定不可用 → 可缓存;临时失败 → 不缓存
     merged: dict = {}
+    decrypted = 0
     for enc in encs:  # V2 在前,优先
         raw = _desktop_decrypt(enc, keyinfo)
         if not raw:
             continue
+        decrypted += 1
         try:
             obj = json.loads(raw)
         except Exception:
@@ -638,7 +682,12 @@ def _read_desktop_tokens(cfg_path: Path) -> list[dict]:
             "refreshToken": v.get("refreshToken"),
             "plan": CLAUDE_PLAN_BADGES.get(str(v.get("subscriptionType") or "").lower()),
         })
-    return out
+    _DESK_DIAG["decrypted"] = decrypted
+    if not decrypted:
+        _DESK_DIAG["error"] = "解密失败(密钥不匹配或缺少解密库)"
+    _DESK_DIAG["tokens"] = len(out)
+    _DESK_DIAG["best_exp"] = max((t["expiresAt"] for t in out), default=0)
+    return out, True
 
 
 # ================= 数据层:Claude(与 Claude Code 同源) =================
@@ -656,10 +705,25 @@ def _keychain_read_service(service: str) -> str | None:
     return out if p.returncode == 0 and out else None
 
 
+def _keychain_service_names() -> tuple:
+    """Claude Code 的钥匙串条目名(与 CLI 同一规则):默认 "Claude Code-credentials";
+       设置了 CLAUDE_CONFIG_DIR 时,CLI 会追加 "-" + sha256(配置目录)[:8]。旧版本还用过 "Claude Code"。"""
+    base = "Claude Code-credentials"
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not cfg:
+        return (base, "Claude Code")
+    import hashlib
+    import unicodedata
+    names = []
+    for c in dict.fromkeys((cfg, os.path.expanduser(cfg), os.path.abspath(os.path.expanduser(cfg)))):
+        names.append(f"{base}-{hashlib.sha256(unicodedata.normalize('NFC', c).encode()).hexdigest()[:8]}")
+    return tuple(dict.fromkeys(names)) + (base, "Claude Code")
+
+
 def _keychain_read_raw() -> str | None:
-    """mac:从登录钥匙串读取 Claude Code 凭证原文(service 名个别版本不一致,逐个尝试)。"""
+    """mac:从登录钥匙串读取 Claude Code 凭证原文(条目名依版本 / 配置目录不同,逐个尝试)。"""
     global _keychain_service
-    for service in ((_keychain_service,) if _keychain_service else ()) + ("Claude Code-credentials", "Claude Code"):
+    for service in ((_keychain_service,) if _keychain_service else ()) + _keychain_service_names():
         out = _keychain_read_service(service)
         if out:
             _keychain_service = service
@@ -772,46 +836,166 @@ def _claude_persist(creds: dict, source: str | None) -> None:
 
 
 _claude_refresh_block_until = 0.0
+_claude_refresh_fails = 0          # 连续失败次数(决定退避时长)
+_claude_refresh_last_err = ""      # 退避期间继续展示的上一次失败原因
+REFRESH_BACKOFF_MAX = 1800         # 续期失败的最长退避(秒)
+
+
+def _fmt_dur(sec: float) -> str:
+    sec = int(max(0, sec))
+    if sec >= 3600:
+        return f"{sec // 3600} 小时 {sec % 3600 // 60} 分"
+    return f"{max(1, sec // 60)} 分钟" if sec >= 60 else f"{sec} 秒"
+
+
+def _claude_refresh_backoff(min_delay: float = 0, retry_after: float | None = None) -> float:
+    """续期失败后退避:60 秒起、每次翻倍、最长 30 分钟;服务端给了 Retry-After 就照办。
+       原先固定每 60 秒重试(且连打两个地址),一旦被限流(HTTP 429)就会一直被限流下去。"""
+    global _claude_refresh_block_until, _claude_refresh_fails
+    _claude_refresh_fails += 1
+    delay = min(REFRESH_RETRY_COOLDOWN * 2 ** (_claude_refresh_fails - 1), REFRESH_BACKOFF_MAX)
+    delay = max(delay, min_delay, retry_after or 0)
+    _claude_refresh_block_until = time.time() + delay
+    return delay
+
+
+def _refresh_lock_paths() -> list[Path]:
+    """Claude Code CLI 续期时持有的两把目录锁:<配置目录>/.oauth_refresh.lock(新)与 <配置目录>.lock(旧)。"""
+    try:
+        legacy = Path(str(CONFIG_DIR.resolve()) + ".lock")
+    except Exception:
+        legacy = Path(str(CONFIG_DIR) + ".lock")
+    return [CONFIG_DIR / ".oauth_refresh.lock", legacy]
+
+
+def _take_dir_lock(p: Path, wait: float) -> str:
+    """mkdir 原子加锁(与 CLI 使用的 proper-lockfile 兼容:60 秒未更新视为持有者已死)。
+       返回 'held' 拿到锁 / 'busy' 一直被占用 / 'skipped' 无法加锁(如目录不可写,不阻塞续期)。"""
+    deadline = time.time() + wait
+    while True:
+        try:
+            p.mkdir()
+            return "held"
+        except FileExistsError:
+            try:
+                if time.time() - p.stat().st_mtime > 60:
+                    p.rmdir()
+                    continue
+            except OSError:
+                continue  # 恰好被释放 / 被别人接管:再试
+            if time.time() >= deadline:
+                return "busy"
+            time.sleep(0.5)
+        except OSError:
+            return "skipped"
+
+
+def _acquire_refresh_lock(wait: float = 8.0) -> list[Path] | None:
+    """与 Claude Code CLI 共用续期锁。refreshToken 每用一次就作废,两边同时续期必有一方失败、
+       甚至把对方的登录挤掉。返回持有的锁(释放用);CLI 正在续期时返回 None。"""
+    held: list[Path] = []
+    for p in _refresh_lock_paths():
+        r = _take_dir_lock(p, wait)
+        if r == "busy":
+            _release_refresh_lock(held)
+            return None
+        if r == "held":
+            held.append(p)
+    return held
+
+
+def _release_refresh_lock(held: list[Path]) -> None:
+    for p in reversed(held):
+        try:
+            p.rmdir()
+        except OSError:
+            pass
 
 
 def _claude_refresh(creds: dict, source: str | None) -> str | None:
-    """用 refreshToken 换新 accessToken 并写回。成功返回 None,失败返回展示给用户的错误文案。"""
-    global _claude_refresh_block_until
+    """用 refreshToken 换新 accessToken 并写回。成功返回 None(creds 已原地更新),失败返回错误文案。
+       做法与官方 Claude Code CLI 一致:持有 CLI 的续期锁 → 锁内重读凭证(CLI 若刚续期过就直接用)
+       → 只请求官方端点,带上凭证里的 scope → 失败按指数退避。"""
+    global _claude_refresh_fails, _claude_refresh_last_err
     oauth = creds.get("claudeAiOauth", {})
-    rt = oauth.get("refreshToken")
-    if not rt:
+    if not oauth.get("refreshToken"):
         return "凭证不含 refreshToken:请在终端运行一次 claude 登录"
     if time.time() < _claude_refresh_block_until:
-        return "token 续期失败,稍后自动重试"
-    body = {"grant_type": "refresh_token", "refresh_token": rt, "client_id": CLAUDE_CLIENT_ID}
-    err = "token 续期失败,稍后自动重试"
-    for url in CLAUDE_TOKEN_URLS:
-        try:
-            r = _http("claude").post(url, json=body, timeout=15, headers={"User-Agent": user_agent()})
-        except requests.RequestException:
-            err = NET_ERR
-            continue
+        return _claude_refresh_last_err or "token 续期失败,稍后自动重试"
+    old_token = oauth.get("accessToken")
+    held = _acquire_refresh_lock()
+    if held is None:  # CLI 正在续期:不去抢,下一轮直接读它写回的新凭证
+        _cli_cache["t"] = 0.0
+        return "Claude Code 正在续期登录,稍后自动刷新"
+    try:
+        fresh, fresh_source = _claude_load(fresh=True)
+        f_tok, f_exp, _ = _cli_info(fresh)
+        if fresh and f_tok and f_tok != old_token and (not f_exp or f_exp - time.time() >= 120):
+            snapshot = dict(fresh)
+            creds.clear()
+            creds.update(snapshot)  # 别处(CLI)刚续期过:直接用它的新令牌,不再消耗 refreshToken
+            _claude_refresh_fails = 0
+            return None
+        if fresh:
+            snapshot = dict(fresh)
+            creds.clear()
+            creds.update(snapshot)
+            source = fresh_source or source
+            oauth = creds.get("claudeAiOauth", {})
+        rt = oauth.get("refreshToken")
+        if not rt:
+            return "凭证不含 refreshToken:请在终端运行一次 claude 登录"
+        body = {"grant_type": "refresh_token", "refresh_token": rt, "client_id": CLAUDE_CLIENT_ID}
+        scopes = oauth.get("scopes")
+        if isinstance(scopes, list) and scopes:
+            body["scope"] = " ".join(str(x) for x in scopes)
+        r = None
+        for url in CLAUDE_TOKEN_URLS:  # 只有连不上时才换备用地址;拿到任何 HTTP 响应都不再换
+            try:
+                r = _http("claude").post(url, json=body, timeout=15,
+                                         headers={"Content-Type": "application/json", "User-Agent": user_agent()})
+                break
+            except requests.RequestException:
+                continue
+        if r is None:
+            _claude_refresh_backoff()
+            _claude_refresh_last_err = NET_ERR
+            return NET_ERR
         if r.ok:
             try:
                 d = r.json()
             except ValueError:
                 d = {}
-            if not d.get("access_token"):
-                err = "token 续期响应异常,稍后重试"
-                continue
-            oauth["accessToken"] = d["access_token"]
-            if d.get("refresh_token"):
-                oauth["refreshToken"] = d["refresh_token"]
-            oauth["expiresAt"] = int((time.time() + float(d.get("expires_in") or 3600)) * 1000)
-            creds["claudeAiOauth"] = oauth
-            _claude_persist(creds, source)
-            return None
+            if d.get("access_token"):
+                oauth["accessToken"] = d["access_token"]
+                if d.get("refresh_token"):
+                    oauth["refreshToken"] = d["refresh_token"]
+                oauth["expiresAt"] = int((time.time() + float(d.get("expires_in") or 3600)) * 1000)
+                if isinstance(d.get("scope"), str) and d["scope"].strip():
+                    oauth["scopes"] = d["scope"].split()
+                creds["claudeAiOauth"] = oauth
+                _claude_persist(creds, source)
+                _claude_refresh_fails, _claude_refresh_last_err = 0, ""
+                return None
+            delay = _claude_refresh_backoff()
+            _claude_refresh_last_err = f"token 续期响应异常,{_fmt_dur(delay)}后重试"
+            return _claude_refresh_last_err
         if r.status_code in (400, 401):
-            _claude_refresh_block_until = time.time() + 300
-            return "凭证已失效:请在终端运行一次 claude 重新登录(此后卡片会自动续期)"
-        err = f"token 续期失败(HTTP {r.status_code}),稍后重试"  # 403/429/5xx → 退避后重试
-    _claude_refresh_block_until = time.time() + REFRESH_RETRY_COOLDOWN
-    return err
+            _claude_refresh_backoff(min_delay=300)
+            _claude_refresh_last_err = "凭证已失效:请在终端运行一次 claude 重新登录(此后卡片会自动续期)"
+            return _claude_refresh_last_err
+        try:
+            retry_after = float(r.headers.get("Retry-After") or 0) or None
+        except (TypeError, ValueError):
+            retry_after = None
+        delay = _claude_refresh_backoff(retry_after=retry_after)
+        if r.status_code == 429:
+            _claude_refresh_last_err = f"登录续期被限流,{_fmt_dur(delay)}后自动重试"
+        else:
+            _claude_refresh_last_err = f"token 续期失败(HTTP {r.status_code}),{_fmt_dur(delay)}后重试"
+        return _claude_refresh_last_err
+    finally:
+        _release_refresh_lock(held)
 
 
 def _claude_bearer_headers(tok: str) -> dict:
@@ -2795,6 +2979,55 @@ def run_check():
         print(f"[{name}] 套餐: {res.get('plan') or '—'}{src}")
         for _key, util, resets_at, label in res["windows"]:
             print(f"  {label:<14} {util:5.1f}%   重置于 {fmt_reset_clock(resets_at)}")
+    for line in _claude_token_report():
+        print(line)
+
+
+def _claude_token_report() -> list[str]:
+    """--check 用:把两条令牌来源分别查一遍,定位"只用桌面版、过一阵就取不到用量"这类问题。"""
+    now = time.time()
+
+    def left(exp):
+        if not exp:
+            return "未记录过期时间"
+        return f"剩余 {_fmt_dur(exp - now)}" if exp > now else f"已过期 {_fmt_dur(now - exp)}"
+
+    lines = ["Claude 令牌诊断:"]
+    creds, source = _claude_load(fresh=True)
+    if creds:
+        oauth = creds.get("claudeAiOauth") or {}
+        _tok, exp, _plan = _cli_info(creds)
+        sc = oauth.get("scopes")
+        lines.append(f"  CLI 令牌({'钥匙串' if source == 'keychain' else '凭证文件'}):{left(exp)}"
+                     f" · refreshToken {'有' if oauth.get('refreshToken') else '无'}"
+                     + (f" · scopes {len(sc)} 个" if isinstance(sc, list) else ""))
+    else:
+        lines.append("  CLI 令牌:未找到(只用桌面版时属正常)")
+    d = _desktop_dir()
+    if not d or not (d / "config.json").exists():
+        lines.append("  桌面版令牌:未找到 Claude 桌面版配置")
+    else:
+        if IS_MAC:
+            lines.append("  (检查桌面版令牌时 macOS 可能弹出钥匙串授权框,请点「始终允许」)")
+        _desk_cache["stamp"] = None  # 强制重读
+        toks = _claude_desktop_tokens()
+        diag = dict(_DESK_DIAG)
+        if toks:
+            best = diag.get("best_exp") or max(t["expiresAt"] for t in toks)
+            lines.append(f"  桌面版令牌:可用({len(toks)} 个候选),最新一个{left(best)}"
+                         + (" —— 打开一次桌面版即会自动续期" if best <= now else ""))
+        else:
+            key = diag.get("key")
+            reason = diag.get("error") or (f"密钥{key}" if key and key != "正常" else "") or "未解出可用令牌"
+            lines.append(f"  桌面版令牌:不可用 —— {reason}")
+            if str(d) in _ss_retry_at:
+                lines.append(f"    {_fmt_dur(_ss_retry_at[str(d)] - now)}后自动重试取密钥")
+    if now < _claude_refresh_block_until:
+        lines.append(f"  自动续期:退避中,{_fmt_dur(_claude_refresh_block_until - now)}后重试"
+                     f"(上次:{_claude_refresh_last_err})")
+    else:
+        lines.append("  自动续期:正常" + (f"(上次失败:{_claude_refresh_last_err})" if _claude_refresh_last_err else ""))
+    return lines
 
 
 _SINGLETON_HANDLE = None

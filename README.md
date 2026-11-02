@@ -46,7 +46,9 @@ The card only uses the login state **already on your machine**, picking whicheve
 **Claude** (cheapest valid source first):
 1. **CLI credential** `~/.claude/.credentials.json` (or the **macOS Keychain**) — used as-is while it's valid; cached in memory, so a refresh costs one `stat`.
 2. **Desktop-app token** — reads the OAuth cache in the Claude desktop app / Cowork `config.json` (classic installer or **Microsoft Store / MSIX** build on Windows) and **decrypts it locally** with the OS's own crypto: Windows DPAPI + BCrypt, macOS CommonCrypto (both via pure `ctypes`, no extra dependency); Linux needs `cryptography`. The desktop app keeps this refreshed, so it's **always alive** — this is what makes "refreshes even when you only use the desktop app" work.
-3. **Auto-refresh** — if neither is valid, the CLI credential is **refreshed via its refreshToken and written back** (atomic write, `0600` perms; Keychain writes go through `security -i` on stdin so the token never shows up in the process list).
+3. **Auto-refresh** — if neither is valid, the CLI credential is **refreshed via its refreshToken and written back** (atomic write, `0600` perms; Keychain writes go through `security -i` on stdin so the token never shows up in the process list). It follows the official CLI exactly — same endpoint and scopes, and it **shares the CLI's refresh lock** (`~/.claude/.oauth_refresh.lock`), so the two never burn the same single-use refreshToken; failures back off exponentially (1 → 30 min, honouring `Retry-After`) instead of hammering the endpoint into rate limits.
+
+**Usage stops refreshing after a while?** Run `./start.sh --check` (or `python quota_card.py --check`) — the **Claude 令牌诊断** section shows how long the CLI token has left, whether the desktop-app token can be decrypted and how fresh it is, and whether auto-refresh is backing off. On macOS, answer the *“Claude Safe Storage”* keychain prompt with **Always Allow** so the desktop-app token keeps working without the terminal.
 
 **Codex:** reads `~/.codex/auth.json` (ChatGPT login mode); when near expiry or rejected, **auto-refreshes via its refreshToken and writes it back**.
 
