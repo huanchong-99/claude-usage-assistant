@@ -4,7 +4,7 @@
 
 它**不绕过任何限额**,只是把官方的用量数字显示出来,方便你掌握节奏。
 
-> **不用终端也能刷新。** 只用 **Claude 桌面版 / Cowork** 的用户,过去常遇到"本地 token 过期、额度刷不出来"——因为卡片只读 CLI 的凭证文件,而你不跑 CLI,那份文件就没人续期。现在卡片会**直接复用桌面版持续自动续期的登录令牌**(本地只读、就地解密),并在需要时**用 refreshToken 自动续期** CLI 凭证。**结果:不用再回终端 `claude` 登录,额度也能一直刷新。**
+> **不用打开终端也能刷新。** CLI 令牌过期后，卡片可以用 Claude 桌面版 / Cowork 已登录的令牌读取用量。用量接口需要 `user:profile` 权限。如果桌面令牌都无法读取用量，卡片会尝试续期已有的 CLI 凭证。
 
 [English](README.md) | 简体中文
 
@@ -25,7 +25,7 @@
 ## 功能
 
 - **同时支持 Claude 与 Codex** —— 两个数据源可**一起显示、也可只选其一**(菜单里勾选)。多源时卡片按数据源分节,各自带套餐徽标(如 Claude `MAX`、Codex `PRO LITE`)。
-- **免终端登录、令牌不再过期** —— 优先复用 **Claude 桌面版**持续自动续期的登录令牌;CLI 凭证临期时也会**自动用 refreshToken 续期并写回**。Codex 同理(读 `~/.codex/auth.json` 并自动续期)。全过程本地完成,只读你已有的登录态。
+- **自动选择登录凭据**。CLI 令牌有效时直接使用，临期或被拒绝时尝试有用量权限的桌面令牌，再按需续期 CLI 凭证。Codex 使用本机的 `~/.codex/auth.json` 并自动续期。
 - **实时 5 小时 / 7 天(每周)用量**(及账号存在的其它窗口),按用量绿 / 黄 / 红变色。
 - **按系统时区显示真实重置时刻**——形如 `今天 04:19` / `06-17 21:59`,根据系统时区(东八区、东七区……)自动换算;底部还有一个实时系统时钟。
 - **系统托盘图标**:白色圆角底 + 按用量变色的大号数字,深色 / 浅色任务栏上都清晰(默认 Claude 5 小时);左键单击显示/隐藏卡片,悬停查看全部明细。支持 StatusNotifierItem 的 Linux 桌面(如 KDE)使用原生托盘,左键同样可以切换卡片。
@@ -41,14 +41,14 @@
 
 ## 令牌从哪来 · 为什么不再过期
 
-卡片只用你**本机已有的登录态**,按"哪份最新鲜"自动挑选,你不必操心:
+卡片使用你**本机已有的登录态**。
 
 **Claude**(按开销从低到高,取第一份有效的):
 1. **CLI 凭证** `~/.claude/.credentials.json`(或 **macOS 钥匙串**)—— 有效期内直接用;内存缓存,每次刷新只需一次 `stat`。
-2. **桌面版令牌** —— 读 Claude 桌面版 / Cowork 的 `config.json` 里的 OAuth 缓存(Windows 上经典安装版与**微软商店 / MSIX 版**均支持),用**系统自带加解密就地解密**:Windows 用 DPAPI + BCrypt,macOS 用 CommonCrypto(均为纯 `ctypes`、无额外依赖);Linux 需装 `cryptography`。桌面版会自己不断续期,所以这份**永远是活的**——这正是"只用桌面版也能刷新"的关键。
+2. **桌面版令牌**。卡片在本机解密 Claude 桌面版 / Cowork 的 OAuth 缓存，Windows 支持经典安装版和微软商店版。Windows 使用系统 DPAPI 和 BCrypt，macOS 使用 CommonCrypto，Linux 使用 `cryptography`。卡片只在含 `user:profile` 权限的 Anthropic API 令牌中比较有效期。如果用量接口拒绝某枚令牌或提示权限不足，会继续尝试其他候选。遇到限流则等待下次刷新。套餐标签用成功读取用量的同一枚令牌查询账号资料。
 3. **自动续期** —— 两者都不可用时,**用 refreshToken 续期 CLI 凭证并写回**(原子写、`0600` 权限;写回钥匙串时经 `security -i` 的标准输入传递,令牌不会出现在进程列表里)。做法与官方 CLI 完全一致——同一端点、同样的 scope,并且**与 CLI 共用续期锁**(`~/.claude/.oauth_refresh.lock`),两边不会同时消耗同一个一次性 refreshToken;失败后按 1 → 30 分钟指数退避(遵守 `Retry-After`),不会把接口打到限流。
 
-**用量过一阵就刷不出来?** 运行 `./start.sh --check`(或 `python quota_card.py --check`),末尾的 **Claude 令牌诊断** 会显示:CLI 令牌还剩多久、桌面版令牌能否解密及新旧程度、自动续期是否在退避。macOS 上遇到「Claude Safe Storage」钥匙串授权框请点 **始终允许**,桌面版令牌才能长期免终端使用。
+**用量停止刷新时**，运行 `./start.sh --check` 或 `python quota_card.py --check`。诊断会报告 CLI 令牌的有效期、带用量权限的桌面候选数和续期状态。“已解密”表示本机读到了候选，“可用”表示本次用量请求实际使用桌面令牌成功。macOS 弹出「Claude Safe Storage」访问请求时，选择**始终允许**即可供卡片后续读取。
 
 **Codex:** 读 `~/.codex/auth.json`(ChatGPT 登录模式),临期或被拒时**自动用 refreshToken 续期并写回**。
 
@@ -85,7 +85,7 @@
 - Python 3.10+,且带 **tkinter(Tk 8.6+)** —— macOS 请用 [python.org 官方安装包](https://www.python.org/downloads/macos/)(自带 Tk)或 Homebrew `brew install python-tk@3.12`;不要用系统自带的 `/usr/bin/python3`(Tk 过旧)
 - `requests`(必需)
 - `pystray` + `Pillow`(可选,用于系统托盘;缺失时自动降级为仅卡片)
-- **Claude:** 已登录过 Claude(桌面版,或终端 `claude` 登录 → 凭证在 `~/.claude/.credentials.json` / macOS 钥匙串)。**只用桌面版即可**,无需终端登录。
+- **Claude** 需要本机现有的登录凭证。桌面版登录提供含 `user:profile` 的令牌即可读取用量。卡片也支持已登录的 CLI 凭证（`~/.claude/.credentials.json` 或 macOS 钥匙串）。
 - **Codex(可选):** 已登录过 OpenAI Codex(`codex` 登录 → 凭证在 `~/.codex/auth.json`)。没装 Codex 就在菜单里只留 Claude。
 - **桌面版令牌解密(可选增强):** Windows 与 macOS 开箱即用(系统自带加解密,无额外依赖);Linux 若要读桌面版令牌,装 `cryptography` 即可(`pip install cryptography`),否则回退到 CLI 凭证路径。
 - **Linux:** 需要合成型窗口管理器(GNOME/KDE 默认即是)以实现半透明;托盘需要系统托盘 / StatusNotifierItem 宿主。*可选:* 装 PyGObject(`sudo apt install python3-gi` / `sudo dnf install python3-gobject`)启用原生托盘——左键切换卡片、中键立即刷新。

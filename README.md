@@ -4,7 +4,7 @@ A tiny, always-on-top desktop card for **Windows, macOS, and Linux** that shows 
 
 It does **not** bypass any limit — it just makes the official numbers visible so you can pace yourself.
 
-> **Refreshes without the terminal.** If you use only the **Claude desktop app / Cowork**, you've probably hit "the local token expired, usage won't refresh" — because the card read only the CLI's credential file, and if you never run the CLI, nothing keeps that file fresh. The card now **reuses the desktop app's continuously-refreshed login token** (read-only, decrypted locally) and **auto-refreshes the CLI credential via its refreshToken** when needed. **Result: usage keeps refreshing without ever going back to `claude` in a terminal.**
+> **Refreshes without the terminal.** When the CLI token expires, the card can read usage with an existing Claude desktop or Cowork login. The usage endpoint requires the `user:profile` scope. If no desktop token works, the card tries to renew an existing CLI credential.
 
 English | [简体中文](README.zh-CN.md)
 
@@ -25,7 +25,7 @@ English | [简体中文](README.zh-CN.md)
 ## Features
 
 - **Claude and Codex together** — show **both sources at once, or pick just one** (toggle in the menu). With multiple sources the card splits into per-source sections, each with its own plan badge (e.g. Claude `MAX`, Codex `PRO LITE`).
-- **No terminal login, tokens don't go stale** — prefers the **Claude desktop app's** continuously-refreshed token; when using the CLI credential it **auto-refreshes via refreshToken and writes it back**. Codex works the same way (reads `~/.codex/auth.json` and auto-refreshes). All local, read-only against your existing login.
+- **Automatic credential selection.** The card uses a valid CLI token first. As it nears expiry or is rejected, the card tries desktop tokens with usage access and renews the CLI credential if needed. Codex reads and refreshes its credential in `~/.codex/auth.json`.
 - **Live 5-hour & 7-day (weekly) usage** (and any other windows your account exposes), color-coded green / amber / red.
 - **Real reset time, your timezone** — shown as a local clock like `今天 04:19` / `06-17 21:59`, derived from your system timezone (UTC+8, UTC+7, …) automatically. A live system clock sits in the footer.
 - **System-tray icon** showing a chosen window's percentage as large color-coded digits on a white badge, readable on dark and light taskbars (default: Claude 5-hour). Left-click toggles the card; hover for a full breakdown. On Linux desktops with StatusNotifierItem (KDE etc.) a native tray is used, so left-click toggles the card there too.
@@ -41,14 +41,14 @@ English | [简体中文](README.zh-CN.md)
 
 ## Where the token comes from · why it stops expiring
 
-The card only uses the login state **already on your machine**, picking whichever copy is freshest so you don't have to think about it:
+The card uses the login state **already on your machine**.
 
 **Claude** (cheapest valid source first):
 1. **CLI credential** `~/.claude/.credentials.json` (or the **macOS Keychain**) — used as-is while it's valid; cached in memory, so a refresh costs one `stat`.
-2. **Desktop-app token** — reads the OAuth cache in the Claude desktop app / Cowork `config.json` (classic installer or **Microsoft Store / MSIX** build on Windows) and **decrypts it locally** with the OS's own crypto: Windows DPAPI + BCrypt, macOS CommonCrypto (both via pure `ctypes`, no extra dependency); Linux needs `cryptography`. The desktop app keeps this refreshed, so it's **always alive** — this is what makes "refreshes even when you only use the desktop app" work.
+2. **Desktop-app token.** The card decrypts the desktop app or Cowork OAuth cache locally. It supports both classic and Microsoft Store installations on Windows using DPAPI and BCrypt, uses CommonCrypto on macOS, and uses `cryptography` on Linux. It compares expiration times among Anthropic API tokens with the `user:profile` scope. If the usage endpoint rejects a credential or reports insufficient scope, the card tries the next candidate. A rate limit ends the current attempt. The plan badge uses the account profile for the token that retrieved usage.
 3. **Auto-refresh** — if neither is valid, the CLI credential is **refreshed via its refreshToken and written back** (atomic write, `0600` perms; Keychain writes go through `security -i` on stdin so the token never shows up in the process list). It follows the official CLI exactly — same endpoint and scopes, and it **shares the CLI's refresh lock** (`~/.claude/.oauth_refresh.lock`), so the two never burn the same single-use refreshToken; failures back off exponentially (1 → 30 min, honouring `Retry-After`) instead of hammering the endpoint into rate limits.
 
-**Usage stops refreshing after a while?** Run `./start.sh --check` (or `python quota_card.py --check`) — the **Claude 令牌诊断** section shows how long the CLI token has left, whether the desktop-app token can be decrypted and how fresh it is, and whether auto-refresh is backing off. On macOS, answer the *“Claude Safe Storage”* keychain prompt with **Always Allow** so the desktop-app token keeps working without the terminal.
+**If usage stops refreshing**, run `./start.sh --check` or `python quota_card.py --check`. The diagnostics report the CLI token lifetime, desktop candidates with usage access, and any refresh backoff. “已解密” means the card decoded a candidate. “可用” means a desktop token retrieved usage during this check. On macOS, choose **Always Allow** at the “Claude Safe Storage” prompt to allow future reads.
 
 **Codex:** reads `~/.codex/auth.json` (ChatGPT login mode); when near expiry or rejected, **auto-refreshes via its refreshToken and writes it back**.
 
@@ -85,7 +85,7 @@ No per-OS build step. On Linux the card falls back to an opaque (square-cornered
 - Python 3.10+ with **tkinter (Tk 8.6+)** — on macOS use the [python.org installer](https://www.python.org/downloads/macos/) (bundles Tk) or Homebrew `brew install python-tk@3.12`; avoid Apple's `/usr/bin/python3` (outdated Tk)
 - [`requests`](https://pypi.org/project/requests/) (required)
 - [`pystray`](https://pypi.org/project/pystray/) + [`Pillow`](https://pypi.org/project/pillow/) (optional — for the system tray; the app degrades to card-only if missing)
-- **Claude:** signed in to Claude at least once — **the desktop app alone is enough**, or a terminal `claude` login (token in `~/.claude/.credentials.json` / macOS Keychain).
+- **Claude** needs an existing login. A desktop login that provides a token with `user:profile` is sufficient. The card also supports CLI credentials in `~/.claude/.credentials.json` or the macOS Keychain.
 - **Codex (optional):** signed in to OpenAI Codex (`codex` login → `~/.codex/auth.json`). No Codex? Just leave only Claude ticked in the menu.
 - **Desktop-token decryption (optional enhancement):** works out of the box on Windows and macOS (system crypto, no extra dependency); on Linux, `pip install cryptography` enables reading the desktop token, otherwise it falls back to the CLI credential.
 - **Linux:** a compositing window manager (the default on GNOME/KDE) for the translucency; the tray needs a system-tray / StatusNotifierItem host. *Optional:* PyGObject (`sudo apt install python3-gi` / `sudo dnf install python3-gobject`) enables the native tray — left-click toggles the card, middle-click refreshes.

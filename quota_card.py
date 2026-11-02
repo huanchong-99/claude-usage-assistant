@@ -39,6 +39,7 @@ import json
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -615,7 +616,7 @@ _desk_cache: dict = {"stamp": None, "tokens": []}
 
 def _claude_desktop_tokens() -> list[dict]:
     """读桌面版 config.json 里的 OAuth 令牌缓存,返回可用于 /api/oauth/usage 的候选:
-       [{'token','expiresAt'(秒),'refreshToken','plan'}],按 api.anthropic.com + user:inference 过滤。只读。
+       [{'token','expiresAt'(秒),'refreshToken','plan'}],只取有 user:profile 权限的 Anthropic API 令牌。
        按文件 (mtime, size) 缓存解密结果:文件没变就不重复解析 + 解密。"""
     d = _desktop_dir()
     if not d:
@@ -668,11 +669,17 @@ def _read_desktop_tokens(cfg_path: Path) -> tuple[list[dict], bool]:
             for k, v in obj.items():
                 merged.setdefault(k, v)
     out = []
+    missing_scope = 0
     for k, v in merged.items():
         if not isinstance(v, dict):
             continue
         tok = v.get("token") or v.get("accessToken")
-        if not tok or "user:inference" not in k or "api.anthropic.com" not in k:
+        if not isinstance(tok, str) or not tok or "api.anthropic.com" not in k:
+            continue
+        # V1/V2 缓存键包含资源和 scope。只读推理/Office 的令牌也可能有很长的有效期，
+        # 但 /api/oauth/usage 会因缺少 user:profile 返回 403。
+        if not re.search(r"(?<![\w.-])user:profile(?![\w.:-])", k):
+            missing_scope += 1
             continue
         exp = float(v.get("expiresAt") or 0)
         exp_s = exp / 1000.0 if exp > 1e12 else exp
@@ -685,6 +692,9 @@ def _read_desktop_tokens(cfg_path: Path) -> tuple[list[dict], bool]:
     _DESK_DIAG["decrypted"] = decrypted
     if not decrypted:
         _DESK_DIAG["error"] = "解密失败(密钥不匹配或缺少解密库)"
+    elif missing_scope and not out:
+        _DESK_DIAG["error"] = "桌面令牌缺少读取用量所需的 user:profile 权限"
+    _DESK_DIAG["missing_scope"] = missing_scope
     _DESK_DIAG["tokens"] = len(out)
     _DESK_DIAG["best_exp"] = max((t["expiresAt"] for t in out), default=0)
     return out, True
@@ -1019,85 +1029,118 @@ def _cli_info(creds: dict | None):
 _claude_last_source = "—"  # 最近一次使用的令牌来源(仅用于 --check 诊断)
 
 
-def claude_headers(rejected: frozenset | set = frozenset()):
-    """返回 (headers, error, plan)。按开销从低到高挑一个可用令牌:
-         1. CLI 凭证(文件 / mac 钥匙串)当前有效 → 直接用(有缓存,几乎零开销)
-         2. 桌面版令牌有效 → 用它(桌面版自己续期,不必动 CLI 的 refreshToken)
-         3. 用 refreshToken 续期 CLI 凭证并写回
-         4. 兜底:任何还没被拒绝过的桌面令牌(即便临期,也比无令牌强)
-       rejected = 本轮已被服务端以 401 拒绝的 token,会被跳过。"""
-    global _claude_last_source
+def _claude_usage_candidates():
+    """依次提供 (token, plan, 来源)。调用方在成功时停止，只有走到续期步骤才会使用 refreshToken。
+       最后一项没有 token，附上续期失败的原因（如有）。"""
     now = time.time()
-
-    def usable(tok, exp):  # exp=0 表示凭证里没写过期时间(老格式):当作可用,401 时再续期
-        return bool(tok) and tok not in rejected and (not exp or exp - now >= 120)
 
     creds, source = _claude_load()
     tok, exp, plan = _cli_info(creds)
-    if not usable(tok, exp) and creds:  # 缓存里的临期/被拒 → 重读一次存储:CLI 可能刚自己续期过
+    if tok and (not exp or exp - now >= 120):  # 老格式可能没有过期时间
+        yield tok, plan, f"CLI 凭证({'钥匙串' if source == 'keychain' else '文件'})"
+    if creds:  # 缓存中的 CLI 令牌临期或被拒。CLI 可能已在别处写回了新的凭证。
         creds, source = _claude_load(fresh=True)
         tok, exp, plan = _cli_info(creds)
-    if usable(tok, exp):
-        _claude_last_source = f"CLI 凭证({'钥匙串' if source == 'keychain' else '文件'})"
-        return _claude_bearer_headers(tok), None, plan
+        if tok and (not exp or exp - now >= 120):
+            yield tok, plan, f"CLI 凭证({'钥匙串' if source == 'keychain' else '文件'})"
 
-    desk = [d for d in _claude_desktop_tokens() if d["token"] not in rejected]
-    valid = [d for d in desk if d["expiresAt"] > now + 60]
-    if valid:
-        best = max(valid, key=lambda d: d["expiresAt"])
-        _claude_last_source = "桌面版令牌"
-        return _claude_bearer_headers(best["token"]), None, best.get("plan")
+    desk = sorted(_claude_desktop_tokens(), key=lambda d: d["expiresAt"], reverse=True)
+    for d in desk:
+        if d["expiresAt"] > now + 60:
+            yield d["token"], d.get("plan"), "桌面版令牌"
 
     err = None
-    if creds:
+    if creds:  # 每轮至多续期一次，即使换来的令牌也被接口拒绝
         err = _claude_refresh(creds, source)
         if err is None:
             tok, exp, plan2 = _cli_info(creds)
-            _claude_last_source = "CLI 凭证(刚续期)"
-            return _claude_bearer_headers(tok), None, plan2 or plan
-        if tok and tok not in rejected and exp > now:  # 续期失败但旧 token 还没真正过期 → 先用着
-            _claude_last_source = "CLI 凭证(临期)"
-            return _claude_bearer_headers(tok), None, plan
-    if desk:
-        best = max(desk, key=lambda d: d["expiresAt"])
-        _claude_last_source = "桌面版令牌(兜底)"
-        return _claude_bearer_headers(best["token"]), None, best.get("plan")
-    return None, err or "未找到登录凭证:打开一次 Claude 桌面版,或在终端运行一次 claude 登录", plan
+            if tok:
+                yield tok, plan2 or plan, "CLI 凭证(刚续期)"
+        elif tok and exp > time.time():
+            yield tok, plan, "CLI 凭证(临期)"
+    for d in desk:
+        if d["expiresAt"] <= now + 60:
+            yield d["token"], d.get("plan"), "桌面版令牌(兜底)"
+    yield None, plan, err
 
 
-def fetch_profile(headers: dict) -> dict | None:
+def _usage_scope_denied(response) -> bool:
+    """只在 403 明确指向 OAuth scope 时换凭据；普通访问限制不触发换令牌。"""
+    if response.status_code != 403:
+        return False
+    if "insufficient_scope" in response.headers.get("WWW-Authenticate", "").lower():
+        return True
+    try:
+        error = response.json().get("error") or {}
+        return "user:profile" in str(error.get("message", "")).lower()
+    except (ValueError, AttributeError):
+        return False
+
+
+def _fetch_profile_plan(headers: dict) -> str | None:
     try:
         r = _http("claude").get(API_URL_PROFILE, headers=headers, timeout=10)
         r.raise_for_status()
-        return r.json()
+        profile = r.json()
+        org_type = (profile.get("organization") or {}).get("organization_type") or ""
+        plan = CLAUDE_PLAN_BADGES.get(org_type.removeprefix("claude_"))
+        if plan:
+            return plan
+        account = profile.get("account") or {}
+        if account.get("has_claude_max"):
+            return "MAX"
+        return "PRO" if account.get("has_claude_pro") else None
     except Exception:
         return None
 
 
+_profile_token: str | None = None
 _profile_plan: str | None = None
-_profile_tried = False
+_profile_retry_at = 0.0
+
+
+def _claude_usage_plan(token: str, headers: dict, plan: str | None, source: str) -> str | None:
+    # 桌面缓存里的 subscriptionType 可能已经过时。用刚成功读取用量的同一枚令牌查询套餐。
+    if plan and not source.startswith("桌面版令牌"):
+        return plan
+    global _profile_token, _profile_plan, _profile_retry_at
+    if token != _profile_token or time.monotonic() >= _profile_retry_at:
+        _profile_plan = _fetch_profile_plan(headers)
+        _profile_token = token
+        _profile_retry_at = time.monotonic() + (3600 if _profile_plan else 300)
+    return _profile_plan or plan
 
 
 def fetch_claude() -> dict:
     """拉取 Claude 用量。返回 {"windows": [(key, util, resets_at, label)], "plan": …} 或 {"error": …}。"""
-    global _profile_plan, _profile_tried
+    global _claude_last_source
+    _claude_last_source = "—"
     s = _http("claude")
-    rejected: set = set()
+    tried = set()
+    denial = None
     try:
-        for _ in range(3):  # 401 → 换下一个候选令牌(或续期)再试,最多 3 次
-            h, err, plan = claude_headers(rejected)
-            if not h:
+        for tok, plan, source in _claude_usage_candidates():
+            if tok is None:
+                err = source or denial or _DESK_DIAG.get("error") or "未找到登录凭证:打开 Claude 桌面版或登录 Claude Code"
                 return {"error": err, "retry_soon": err == NET_ERR}
+            if tok in tried:
+                continue  # 同一令牌可能同时出现在两个缓存或锁内重读结果里
+            tried.add(tok)
+            h = _claude_bearer_headers(tok)
             r = s.get(API_URL_USAGE, headers=h, timeout=10)
-            if r.status_code != 401:
-                break
-            rejected.add(h["Authorization"][len("Bearer "):])
-        else:
-            return {"error": "登录已过期:请在终端运行一次 claude 重新登录"}
-        if r.status_code == 429:
-            return {"error": "请求过于频繁,稍后自动重试"}
-        r.raise_for_status()
-        data = r.json()
+            if r.status_code == 401:
+                denial = "用量接口拒绝登录凭证(HTTP 401)"
+                continue
+            if _usage_scope_denied(r):
+                denial = "令牌缺少读取用量所需的 user:profile 权限(HTTP 403)"
+                continue
+            if r.status_code == 429:
+                return {"error": "请求过于频繁(HTTP 429),稍后自动重试"}
+            if not r.ok:
+                return {"error": f"用量接口请求失败(HTTP {r.status_code})"}
+            data = r.json()
+            _claude_last_source = source
+            break
     except (requests.ConnectionError, requests.Timeout):
         return {"error": NET_ERR, "retry_soon": True}
     except Exception as e:
@@ -1108,11 +1151,7 @@ def fetch_claude() -> dict:
                 and val.get("resets_at")):
             wins.append((key, float(val["utilization"]), val["resets_at"], LABELS.get(key, key)))
     wins.sort(key=lambda it: (ORDER.index(it[0]) if it[0] in ORDER else len(ORDER), it[0]))
-    if plan is None and not _profile_tried:  # 老版本凭证无 subscriptionType → 拉一次 profile 兜底
-        _profile_tried = True
-        acc = (fetch_profile(h) or {}).get("account", {})
-        _profile_plan = "MAX" if acc.get("has_claude_max") else ("PRO" if acc.get("has_claude_pro") else None)
-    return {"windows": wins, "plan": plan or _profile_plan}
+    return {"windows": wins, "plan": _claude_usage_plan(tok, h, plan, source)}
 
 
 # ================= 数据层:Codex(与 Codex CLI 同源) =================
@@ -3014,8 +3053,10 @@ def _claude_token_report() -> list[str]:
         diag = dict(_DESK_DIAG)
         if toks:
             best = diag.get("best_exp") or max(t["expiresAt"] for t in toks)
-            lines.append(f"  桌面版令牌:可用({len(toks)} 个候选),最新一个{left(best)}"
-                         + (" —— 打开一次桌面版即会自动续期" if best <= now else ""))
+            state = "可用" if _claude_last_source.startswith("桌面版令牌") else "已解密"
+            lines.append(f"  桌面版令牌:{state}({len(toks)} 个含 user:profile 的候选),最长有效期:{left(best)}")
+            if diag.get("missing_scope"):
+                lines.append(f"    已跳过 {diag['missing_scope']} 个缺少用量权限的桌面令牌")
         else:
             key = diag.get("key")
             reason = diag.get("error") or (f"密钥{key}" if key and key != "正常" else "") or "未解出可用令牌"
