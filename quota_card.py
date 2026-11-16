@@ -101,7 +101,8 @@ REFRESH_RETRY_COOLDOWN = 60  # token 续期失败后的最小重试间隔(秒)
 KEYCHAIN_CACHE_TTL = 300     # mac 钥匙串凭证在内存里的缓存时长(秒),避免每分钟起一次 security 子进程
 
 # Claude(与 Claude Code CLI 同源的官方接口与 OAuth 客户端)
-API_URL_USAGE = "https://api.anthropic.com/api/oauth/usage"
+# 与 Claude Code CLI 读取各额度窗口时相同的请求(skip_spend=1:跳过消费额度计算,响应更快)
+API_URL_USAGE = "https://api.anthropic.com/api/oauth/usage?skip_spend=1"
 API_URL_PROFILE = "https://api.anthropic.com/api/oauth/profile"
 CLAUDE_TOKEN_URLS = ("https://platform.claude.com/v1/oauth/token",
                      "https://console.anthropic.com/v1/oauth/token")
@@ -127,7 +128,7 @@ _WIN_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 MIN_ZOOM, MAX_ZOOM = 0.6, 2.2
 EDGE = 7  # 边缘缩放感应区(基准像素)
-DEFAULT_TRAY_KEY = "five_hour"
+DEFAULT_TRAY_KEY = "auto"  # 托盘默认跟随服务端选定的"头条"额度(limits[] 里 is_active 的那一行)
 
 # 滚轮:Windows 按 delta 累计到 120 走一档(兼容高精度滚轮/触控板);
 # mac/Linux 的 Tk 事件不带统一刻度(mac 触控板一次滑动会连发几十个事件),按时间节流。
@@ -153,7 +154,15 @@ C_RED = "#ef5350"
 PROVIDERS = ("claude", "codex")
 PROVIDER_TITLES = {"claude": "Claude", "codex": "Codex"}
 PROVIDER_DOTS = {"claude": C_ACCENT, "codex": "#10a37f"}
-CLAUDE_PLAN_BADGES = {"max": "MAX", "pro": "PRO", "team": "TEAM", "enterprise": "ENT"}
+CLAUDE_PLAN_BADGES = {"max": "MAX", "pro": "PRO", "team": "TEAM", "enterprise": "ENT", "ultra": "ULTRA"}
+
+
+def _claude_plan_badge(sub) -> str | None:
+    """套餐徽标:认识的用固定缩写;不认识的(如新推出的套餐)直接显示其名称,而不是什么都不显示。"""
+    name = str(sub or "").strip().lower().removeprefix("claude_")
+    if not name:
+        return None
+    return CLAUDE_PLAN_BADGES.get(name) or name.replace("_", " ").upper()[:8]
 CODEX_PLAN_BADGES = {"free": "FREE", "plus": "PLUS", "pro": "PRO", "prolite": "PRO LITE",
                      "team": "TEAM", "business": "BIZ", "enterprise": "ENT", "edu": "EDU"}
 
@@ -170,6 +179,9 @@ LABELS = {
 }
 ORDER = ["five_hour", "seven_day", "iguana_necktie", "seven_day_opus", "seven_day_sonnet",
          "seven_day_cowork", "seven_day_oauth_apps"]
+# limits[] 的 group → 时间窗口文字;kind → 沿用旧键名(保留用户已有的「卡片显示 / 托盘显示」设置)
+GROUP_LABELS = {"session": "5 小时", "weekly": "7 天", "daily": "今日", "monthly": "本月"}
+SEVERITY_COLORS = {"normal": "#46c46a", "warning": "#e0a23a", "critical": "#ef5350"}
 WEEK = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 NET_ERR = "网络连接失败,重试中…"
@@ -687,7 +699,7 @@ def _read_desktop_tokens(cfg_path: Path) -> tuple[list[dict], bool]:
             "token": tok,
             "expiresAt": exp_s,
             "refreshToken": v.get("refreshToken"),
-            "plan": CLAUDE_PLAN_BADGES.get(str(v.get("subscriptionType") or "").lower()),
+            "plan": _claude_plan_badge(v.get("subscriptionType")),
         })
     _DESK_DIAG["decrypted"] = decrypted
     if not decrypted:
@@ -1023,7 +1035,7 @@ def _cli_info(creds: dict | None):
     exp = float(oauth.get("expiresAt") or 0)
     exp = exp / 1000.0 if exp > 1e12 else exp
     return (oauth.get("accessToken"), exp,
-            CLAUDE_PLAN_BADGES.get(str(oauth.get("subscriptionType") or "").lower()))
+            _claude_plan_badge(oauth.get("subscriptionType")))
 
 
 _claude_last_source = "—"  # 最近一次使用的令牌来源(仅用于 --check 诊断)
@@ -1083,9 +1095,8 @@ def _fetch_profile_plan(headers: dict) -> str | None:
         r.raise_for_status()
         profile = r.json()
         org_type = (profile.get("organization") or {}).get("organization_type") or ""
-        plan = CLAUDE_PLAN_BADGES.get(org_type.removeprefix("claude_"))
-        if plan:
-            return plan
+        if org_type.startswith("claude_"):  # claude_max / claude_pro / claude_ultra …(新套餐也照样显示名称)
+            return _claude_plan_badge(org_type)
         account = profile.get("account") or {}
         if account.get("has_claude_max"):
             return "MAX"
@@ -1145,13 +1156,67 @@ def fetch_claude() -> dict:
         return {"error": NET_ERR, "retry_soon": True}
     except Exception as e:
         return {"error": f"获取失败:{type(e).__name__}"}
-    wins = []
-    for key, val in data.items():
-        if (isinstance(val, dict) and val.get("utilization") is not None
-                and val.get("resets_at")):
-            wins.append((key, float(val["utilization"]), val["resets_at"], LABELS.get(key, key)))
-    wins.sort(key=lambda it: (ORDER.index(it[0]) if it[0] in ORDER else len(ORDER), it[0]))
-    return {"windows": wins, "plan": _claude_usage_plan(tok, h, plan, source)}
+    parsed = _parse_claude_limits(data)
+    if parsed is not None:
+        wins, meta = parsed
+    else:  # 老格式响应(没有 limits[]):按固定键解析
+        wins, meta = [], {}
+        for key, val in data.items():
+            if (isinstance(val, dict) and val.get("utilization") is not None
+                    and val.get("resets_at")):
+                wins.append((key, float(val["utilization"]), val["resets_at"], LABELS.get(key, key)))
+        wins.sort(key=lambda it: (ORDER.index(it[0]) if it[0] in ORDER else len(ORDER), it[0]))
+    return {"windows": wins, "meta": meta, "plan": _claude_usage_plan(tok, h, plan, source)}
+
+
+def _limit_key(kind: str, group: str, name: str) -> str:
+    """limits[] 的一行 → 稳定键名。尽量沿用老格式的键,用户之前的「卡片显示 / 托盘显示」设置继续有效。"""
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    if kind == "session":
+        return "five_hour"
+    if kind == "weekly_all":
+        return "seven_day"
+    if kind == "weekly_scoped" and slug:
+        # 只取模型系列名("Opus 5.5" → opus):对上老键 seven_day_opus / seven_day_sonnet,
+        # 模型升级换版本号后键名也不变;Fable → seven_day_fable
+        family = re.match(r"[a-z0-9]+", slug)
+        return f"seven_day_{family.group(0) if family else slug}"
+    return "_".join(x for x in (kind or "limit", group, slug) if x)
+
+
+def _parse_claude_limits(data) -> tuple[list, dict] | None:
+    """解析用量接口的 limits[](服务端的额度行,当前格式)。没有该字段时返回 None,由调用方按老格式解析。
+       官方约定:按 kind 判断额度类型、绝不按标签判断;行按服务端给的顺序显示;配色看 severity;
+       is_active 是服务端选定的"头条"额度(只能显示一个数字时显示哪一行)。
+       Ultra 等没有 5 小时窗口的套餐、Fable 等新增的按模型周额度,都只有这里能正确反映——
+       老格式的固定键(five_hour / seven_day / …)表达不了。"""
+    rows = data.get("limits") if isinstance(data, dict) else None
+    if not isinstance(rows, list) or not rows:
+        return None
+    wins, meta = [], {}
+    for row in rows:
+        if not isinstance(row, dict) or row.get("percent") is None:
+            continue
+        kind, group = str(row.get("kind") or ""), str(row.get("group") or "")
+        scope = row.get("scope") if isinstance(row.get("scope"), dict) else {}
+        name = ""
+        for part in ("model", "surface"):
+            info = scope.get(part)
+            if isinstance(info, dict) and info.get("display_name"):
+                name = str(info["display_name"])
+                break
+        key = _limit_key(kind, group, name)
+        if key in meta:  # 同键重复(理论上不会):追加序号,两行都显示
+            key = f"{key}_{len(meta)}"
+        window = GROUP_LABELS.get(group, group or kind or "额度")
+        label = f"{window} · {name}" if name else window
+        try:
+            pct = float(row["percent"])
+        except (TypeError, ValueError):
+            continue
+        wins.append((key, pct, str(row.get("resets_at") or ""), label))
+        meta[key] = {"severity": row.get("severity"), "active": bool(row.get("is_active"))}
+    return (wins, meta) if wins else None
 
 
 # ================= 数据层:Codex(与 Codex CLI 同源) =================
@@ -1624,7 +1689,10 @@ def fmt_countdown(resets_at: str) -> str:
     return f"还有 {m} 分 {s} 秒"
 
 
-def bar_color(util: float) -> str:
+def bar_color(util: float, severity: str | None = None) -> str:
+    """服务端给了 severity(limits[] 的配色依据)就照办——官方约定客户端不自行评级;否则按 50% / 80% 阈值。"""
+    if severity in SEVERITY_COLORS:
+        return SEVERITY_COLORS[severity]
     return C_RED if util >= 80 else (C_AMBER if util >= 50 else C_GREEN)
 
 
@@ -2046,11 +2114,11 @@ class QuotaCard:
                     return
                 old = self.state.get(p) or {}
                 if "windows" in res:
-                    cur = {"windows": res["windows"], "plan": res.get("plan") or old.get("plan"),
-                           "error": None, "updated": time.time()}
+                    cur = {"windows": res["windows"], "meta": res.get("meta") or {},
+                           "plan": res.get("plan") or old.get("plan"), "error": None, "updated": time.time()}
                 else:  # 失败时保留上一次数据,只标注错误
-                    cur = {"windows": old.get("windows") or [], "plan": old.get("plan"),
-                           "error": res.get("error"), "updated": old.get("updated", 0)}
+                    cur = {"windows": old.get("windows") or [], "meta": old.get("meta") or {},
+                           "plan": old.get("plan"), "error": res.get("error"), "updated": old.get("updated", 0)}
                     soon = soon or bool(res.get("retry_soon"))
                 self.state = {**self.state, p: cur}
                 self._post("data")
@@ -2128,7 +2196,7 @@ class QuotaCard:
             st = self.state.get(p) or {"windows": [], "plan": None, "error": "正在加载…", "updated": 0}
             wins = st.get("windows") or []
             out.append({"p": p, "plan": st.get("plan"), "error": st.get("error"),
-                        "updated": st.get("updated", 0), "wins": wins,
+                        "updated": st.get("updated", 0), "wins": wins, "meta": st.get("meta") or {},
                         "shown": [w for w in wins if w[0] not in self.hidden]})
         return out
 
@@ -2137,7 +2205,8 @@ class QuotaCard:
            "N 秒前更新"、时钟、倒计时这类每秒都变的文字不在其中,走 _update_dynamic 原地改字。"""
         return (self.zoom, self.pinned, self.reset_mode,
                 tuple((s_["p"], s_["plan"], s_["error"], bool(s_["updated"]),
-                       tuple(s_["wins"]), tuple(s_["shown"])) for s_ in secs))
+                       tuple(s_["wins"]), tuple(s_["shown"]),
+                       tuple(sorted((k, v.get("severity")) for k, v in s_["meta"].items()))) for s_ in secs))
 
     def render(self, force: bool = False):
         """数据或布局变了才整卡重绘;否则只更新每秒变化的几处文字(开销降到原来的零头)。"""
@@ -2237,7 +2306,8 @@ class QuotaCard:
                 y += SEC
             if s_["shown"]:
                 for _key, util, resets_at, label in s_["shown"]:
-                    self._draw_row(cv, y, label, util, resets_at, W, PAD)
+                    self._draw_row(cv, y, label, util, resets_at, W, PAD,
+                                   (s_["meta"].get(_key) or {}).get("severity"))
                     y += ROW
             else:
                 if s_["wins"]:
@@ -2300,8 +2370,8 @@ class QuotaCard:
         if s_["error"] and s_["shown"]:  # 有旧数据但本轮刷新失败 → 分节右侧亮警示
             cv.create_text(W - PAD, cy, text="⚠", anchor="e", fill=C_AMBER, font=self.f(11))
 
-    def _draw_row(self, cv, y, label, util, resets_at, W, PAD):
-        col = bar_color(util)
+    def _draw_row(self, cv, y, label, util, resets_at, W, PAD, severity=None):
+        col = bar_color(util, severity)
         cy1 = y + self.s(10)
         cv.create_text(PAD, cy1, text=label, anchor="w", fill=C_SUB, font=self.f(12))
         cv.create_text(W - PAD, cy1, text=f"{util:.0f}%", anchor="e", fill=col, font=self.f(16, "bold"))
@@ -2449,7 +2519,7 @@ class QuotaCard:
     # 托盘位图里数字用的颜色:同色相的深色,保证在白底上清晰(卡片用的亮色在白底上对比度只有 ~2:1)
     _TRAY_INK = {C_GREEN: (22, 128, 61), C_AMBER: (180, 95, 6), C_RED: (200, 30, 30)}
 
-    def _tray_image(self, util):
+    def _tray_image(self, util, severity=None):
         """托盘位图(Windows 任务栏 / Linux 托盘 / mac 无 PyObjC 时兜底)。
            白色半透明圆角底 + 用量色纯数字(不带 %):黑底彩字在深色任务栏上对比度不足、
            "%" 在 16~24px 的实际尺寸下几乎看不清,去掉后数字能放得更大(issue #3)。
@@ -2459,7 +2529,7 @@ class QuotaCard:
         if util is None:
             ink, txt = (110, 110, 118), "–"
         else:
-            ink, txt = self._TRAY_INK.get(bar_color(util), (40, 40, 40)), str(int(round(util)))
+            ink, txt = self._TRAY_INK.get(bar_color(util, severity), (40, 40, 40)), str(int(round(util)))
         img = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         d.rounded_rectangle([pad, pad, sz - pad - 1, sz - pad - 1], radius=int(sz * 0.22),
@@ -2481,12 +2551,17 @@ class QuotaCard:
         if not self.tray:
             return
         secs = self._sections() if secs is None else secs
-        avail = [(s_["p"], k, u, lbl) for s_ in secs for (k, u, _r, lbl) in s_["wins"]]
+        avail = [(s_["p"], k, u, lbl, s_["meta"].get(k) or {}) for s_ in secs for (k, u, _r, lbl) in s_["wins"]]
         if not avail:
             return
-        p, key, util, lbl = next((it for it in avail if it[1] == self.tray_key), avail[0])
-        rgb = _hex_rgb(bar_color(util))
-        lines = "\n".join(f"{PROVIDER_TITLES[pp]} · {ll} {uu:.0f}%" for pp, _kk, uu, ll in avail)
+        # 用户指定的项不存在(如 Ultra 没有 5 小时窗口)或选了「自动」→ 用服务端选定的头条额度
+        pick = next((it for it in avail if it[1] == self.tray_key), None)
+        if pick is None:
+            pick = next((it for it in avail if it[4].get("active")), avail[0])
+        p, key, util, lbl, info = pick
+        sev = info.get("severity")
+        rgb = _hex_rgb(bar_color(util, sev))
+        lines = "\n".join(f"{PROVIDER_TITLES[pp]} · {ll} {uu:.0f}%" for pp, _kk, uu, ll, _m in avail)
         tip = (f"AI 用量(托盘:{PROVIDER_TITLES[p]} · {lbl})\n" + lines)[:120]
         sig = (key, int(round(util)), rgb, tip)
         if sig == self._tray_sig:
@@ -2497,7 +2572,7 @@ class QuotaCard:
             if self._mac_text_tray and not self._mac_status_title(text, rgb):
                 self._mac_text_tray = False  # 菜单栏文字不可用 → 永久退回位图图标
             if not self._mac_text_tray:
-                self.tray.icon = self._tray_image(util)
+                self.tray.icon = self._tray_image(util, sev)
             self.tray.title = tip
         except Exception:
             pass
@@ -2713,6 +2788,9 @@ class QuotaCard:
         if self.tray:
             tm = tk.Menu(m, tearoff=0)
             self._tray_var = tk.StringVar(value=self.tray_key)
+            tm.add_radiobutton(label="自动(跟随官方提示的额度)", value="auto", variable=self._tray_var,
+                               command=lambda: self.set_tray_key("auto"))
+            tm.add_separator()
             if flat:
                 for p, key, lbl in flat:
                     tm.add_radiobutton(label=f"{PROVIDER_TITLES[p]} · {lbl}", value=key,
@@ -3016,8 +3094,10 @@ def run_check():
             continue
         src = f" · 令牌来源: {_claude_last_source}" if name == "Claude" else ""
         print(f"[{name}] 套餐: {res.get('plan') or '—'}{src}")
+        meta = res.get("meta") or {}
         for _key, util, resets_at, label in res["windows"]:
-            print(f"  {label:<14} {util:5.1f}%   重置于 {fmt_reset_clock(resets_at)}")
+            tag = "   ← 官方头条(托盘「自动」显示这一项)" if (meta.get(_key) or {}).get("active") else ""
+            print(f"  {label:<14} {util:5.1f}%   重置于 {fmt_reset_clock(resets_at)}{tag}")
     for line in _claude_token_report():
         print(line)
 
