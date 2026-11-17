@@ -133,6 +133,33 @@ class ClaudeUsageTests(unittest.TestCase):
         self.assertEqual(card.fetch_claude()["plan"], "PRO")
         self.assertEqual(self.profile_requests, ["first", "second"])
 
+    def test_profile_display_name_wins_over_organization_type_for_desktop_token(self):
+        self.cache(new=[("user:profile", "desk", 7200)], plan="max")
+        self.serve({"desk": (200, "")})
+        self.profile_payload = {"organization": {"organization_type": "claude_max", "plan_display_name": "Ultra"}}
+        self.assertEqual(card.fetch_claude()["plan"], "ULTRA")
+
+    def test_cli_token_also_consults_profile_and_caches_it(self):
+        self.cli(3600)
+        self.serve({"cli": (200, "")})
+        self.profile_payload = {"organization": {"organization_type": "claude_max", "plan_display_name": "Ultra"}}
+        for _ in range(2):
+            self.assertEqual(card.fetch_claude()["plan"], "ULTRA")
+        self.assertEqual(self.profile_requests, ["cli"])
+
+    def test_profile_without_display_name_falls_back_to_organization_type(self):
+        self.cli(3600)
+        self.serve({"cli": (200, "")})
+        self.profile_payload = {"organization": {"organization_type": "claude_max"}}
+        self.assertEqual(card.fetch_claude()["plan"], "MAX")
+
+    def test_failed_profile_request_falls_back_to_credential_plan(self):
+        self.cli(3600)
+        self.serve({"cli": (200, "")})
+        self.profile_payload = None  # profile 返回 503
+        self.assertEqual(card.fetch_claude()["plan"], "MAX")
+        self.assertEqual(self.profile_requests, ["cli"])
+
 
 if __name__ == "__main__":
     unittest.main()

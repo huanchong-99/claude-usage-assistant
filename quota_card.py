@@ -1094,7 +1094,12 @@ def _fetch_profile_plan(headers: dict) -> str | None:
         r = _http("claude").get(API_URL_PROFILE, headers=headers, timeout=10)
         r.raise_for_status()
         profile = r.json()
-        org_type = (profile.get("organization") or {}).get("organization_type") or ""
+        org = profile.get("organization") or {}
+        # 官方展示名(如 Ultra)优先:organization_type 是内部类型(Ultra 的类型仍是 claude_max)
+        display = org.get("plan_display_name")
+        if isinstance(display, str) and display.strip():
+            return _claude_plan_badge(display)
+        org_type = org.get("organization_type") or ""
         if org_type.startswith("claude_"):  # claude_max / claude_pro / claude_ultra …(新套餐也照样显示名称)
             return _claude_plan_badge(org_type)
         account = profile.get("account") or {}
@@ -1111,9 +1116,8 @@ _profile_retry_at = 0.0
 
 
 def _claude_usage_plan(token: str, headers: dict, plan: str | None, source: str) -> str | None:
-    # 桌面缓存里的 subscriptionType 可能已经过时。用刚成功读取用量的同一枚令牌查询套餐。
-    if plan and not source.startswith("桌面版令牌"):
-        return plan
+    # 凭据缓存(桌面版/命令行)里的 subscriptionType 是内部类型(如 max)且可能已过时,官方套餐名(如 Ultra)只在 profile 里。
+    # 所以不论令牌来源,都用刚成功读取用量的同一枚令牌查询套餐;查询失败时回退到缓存里的套餐。
     global _profile_token, _profile_plan, _profile_retry_at
     if token != _profile_token or time.monotonic() >= _profile_retry_at:
         _profile_plan = _fetch_profile_plan(headers)
